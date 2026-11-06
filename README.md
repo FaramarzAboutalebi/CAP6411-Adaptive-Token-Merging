@@ -31,6 +31,13 @@ We have four technical workstreams. **Each member chooses one primary role.** No
 
 Each role includes implementation, testing, experiments, documentation, and contributing to the final report and presentation.
 
+| Workstream | Selection |
+|---|---|
+| Dataset & segmentation baseline | Unassigned |
+| Adaptive token merging | Unassigned |
+| Efficiency & baseline comparisons | Unassigned |
+| Segmentation evaluation & ablations | Unassigned |
+
 ### Role 1 — Dataset & Segmentation Baseline
 
 **Goal:** Build a working uncompressed segmentation model.
@@ -44,9 +51,8 @@ Tasks:
 - Establish baseline Dice, latency, and memory measurements.
 
 **Main files:**
-- `src/data/`
-- `src/models/baseline.py`
-- `scripts/train_baseline.py`
+- `src/cap6411_atm/data/`
+- `src/cap6411_atm/models/`
 - `notebooks/01_baseline.ipynb`
 
 **Deliverables:** Reproducible baseline, model checkpoint, prediction outputs, and initial results.
@@ -65,8 +71,8 @@ Tasks:
 - Integrate merging into the baseline encoder.
 
 **Main files:**
-- `src/merging/`
-- `src/models/adaptive_model.py`
+- `src/cap6411_atm/merging/`
+- `src/cap6411_atm/models/`
 - `notebooks/02_token_merging.ipynb`
 
 **Deliverables:** Working uniform/adaptive merging implementations, integration tests, and configurable experiments.
@@ -84,8 +90,7 @@ Tasks:
 - Generate efficiency-versus-quality plots and tables.
 
 **Main files:**
-- `src/benchmark/`
-- `scripts/benchmark.py`
+- `src/cap6411_atm/benchmark/`
 - `notebooks/03_efficiency.ipynb`
 
 **Deliverables:** Reproducible benchmarks, comparison tables, and efficiency plots.
@@ -103,8 +108,7 @@ Tasks:
 - Analyze failure cases and summarize experimental findings.
 
 **Main files:**
-- `src/evaluation/`
-- `scripts/evaluate.py`
+- `src/cap6411_atm/evaluation/`
 - `notebooks/04_evaluation.ipynb`
 
 **Deliverables:** Evaluation pipeline, ablation tables, qualitative visualizations, and failure analysis.
@@ -160,7 +164,7 @@ All methods must use compatible preprocessing, splits, prediction formats, and e
 3. Clone the GitHub repository into the Colab session.
 4. Install dependencies from `requirements.txt`.
 5. Mount Google Drive if your task requires datasets or checkpoints.
-6. Import reusable modules from `src/`.
+6. Import reusable modules from the `cap6411_atm` package in `src/`.
 7. Run your experiments.
 8. Save checkpoints and large outputs to Drive.
 9. Commit source code, notebooks, configurations, and small result summaries to GitHub.
@@ -172,13 +176,30 @@ from google.colab import drive
 drive.mount("/content/drive")
 ```
 
-```bash
-!git clone https://github.com/OWNER/CAP6411-Adaptive-Token-Merging.git
-%cd CAP6411-Adaptive-Token-Merging
-!pip install -r requirements.txt
+For this private repository, create a fine-grained GitHub personal access token with read-only access to this repository, save it in Colab Secrets as `GITHUB_TOKEN`, and use an HTTP authorization header so the token is not written into the clone URL or notebook:
+
+```python
+from google.colab import userdata
+import subprocess
+
+token = userdata.get("GITHUB_TOKEN")
+subprocess.run(
+    [
+        "git", "-c", f"http.extraHeader=Authorization: Bearer {token}",
+        "clone", "https://github.com/FaramarzAboutalebi/CAP6411-Adaptive-Token-Merging.git",
+    ],
+    check=True,
+)
+del token
 ```
 
-Replace `OWNER` with the repository owner. Private repositories require authorized GitHub access.
+```python
+%cd /content/CAP6411-Adaptive-Token-Merging
+!pip install -r requirements.txt
+!pip install -e . --no-deps
+```
+
+Grant the notebook access to the secret only when prompted. Never print the token, place it directly in a URL, save it in a notebook, or commit it. Team members with repository access may use an equivalent GitHub App or SSH credential flow.
 
 **Important:**
 - Colab runtime storage is temporary.
@@ -186,13 +207,14 @@ Replace `OWNER` with the repository owner. Private repositories require authoriz
 - Do not put GitHub tokens or other secrets inside notebooks.
 - Do not use different GPU types for direct latency comparisons.
 - Record the exact GPU, software versions, and experiment settings.
-- Keep substantial implementations in `src/`, not scattered across notebooks.
+- Keep substantial implementations in `src/cap6411_atm/`, not scattered across notebooks.
 
 ## Repository Structure
 
 ```text
 CAP6411-Adaptive-Token-Merging/
 ├── README.md
+├── pyproject.toml
 ├── requirements.txt
 ├── .gitignore
 │
@@ -203,20 +225,17 @@ CAP6411-Adaptive-Token-Merging/
 │   └── 04_evaluation.ipynb
 │
 ├── src/
-│   ├── data/
-│   ├── models/
-│   ├── merging/
-│   ├── benchmark/
-│   └── evaluation/
-│
-├── scripts/
-│   ├── train_baseline.py
-│   ├── benchmark.py
-│   └── evaluate.py
+│   └── cap6411_atm/
+│       ├── data/
+│       ├── models/
+│       ├── merging/
+│       ├── benchmark/
+│       └── evaluation/
 │
 ├── configs/
 ├── tests/
-├── results/
+├── data/       # local-only; contents ignored
+├── outputs/    # generated artifacts; contents ignored
 │
 └── docs/
     ├── CONTRIBUTING.md
@@ -226,6 +245,14 @@ CAP6411-Adaptive-Token-Merging/
 Only source code, configurations, small result tables/plots, and documentation belong in GitHub.
 
 Datasets and large model checkpoints remain in private storage.
+
+For a local editable setup, create and activate a virtual environment, then run:
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip install -e . --no-deps
+python -m unittest discover -s tests
+```
 
 ## Timeline
 
@@ -268,7 +295,7 @@ The report must include:
 3. Open a pull request when your code is ready.
 4. Include a short description and how the changes were tested.
 5. Request a teammate's review before merging.
-6. Keep notebooks lightweight and reusable code in `src/`.
+6. Keep notebooks lightweight and reusable code in `src/cap6411_atm/`.
 7. Do not commit private datasets, large checkpoints, credentials, or generated caches.
 8. Record experiment configurations and results.
 9. Communicate interface changes before merging.
