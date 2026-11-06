@@ -1,0 +1,8 @@
+# Keep the base environment small. Add model-specific packages after implementation selection.
+# Install a platform-appropriate PyTorch build; no GPU-specific version is pinned here.
+torch
+numpy
+nibabel
+matplotlib
+tqdm
+jupyter
