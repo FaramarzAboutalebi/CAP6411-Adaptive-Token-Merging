@@ -131,12 +131,12 @@ We will agree on tensor formats before implementation.
 Proposed interfaces:
 
 ```python
-# images: [B, C, H, W]
-# logits: [B, K, H, W]
+# BraTS-GLI images: [B, 4, H, W] in T1n, T1c, T2w, T2f order
+# logits: [B, 3, H, W] for overlapping WT, TC, ET regions
 logits = model(images)
 
-# labels: [B, H, W]
-results = evaluate(logits, labels)
+# targets: [B, 3, H, W] multi-hot masks; use sigmoid-style outputs
+results = evaluate(logits, targets)
 ```
 
 The final number of input channels and segmentation outputs will depend on our selected BraTS configuration.
