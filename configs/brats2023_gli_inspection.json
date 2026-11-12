@@ -1,0 +1,15 @@
+{
+  "file_suffixes": {
+    "t1": "-t1n.nii.gz",
+    "t1ce": "-t1c.nii.gz",
+    "t2": "-t2w.nii.gz",
+    "flair": "-t2f.nii.gz",
+    "segmentation": "-seg.nii.gz"
+  },
+  "segmentation_key": "segmentation",
+  "expected_shape": [240, 240, 155],
+  "expected_spacing": [1.0, 1.0, 1.0],
+  "allowed_segmentation_labels": [0, 1, 2, 3],
+  "affine_tolerance": 1e-05,
+  "spacing_tolerance": 1e-05
+}
