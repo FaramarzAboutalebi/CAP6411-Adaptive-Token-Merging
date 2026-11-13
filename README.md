@@ -131,12 +131,12 @@ We will agree on tensor formats before implementation.
 Proposed interfaces:
 
 ```python
-# images: [B, C, H, W]
-# logits: [B, K, H, W]
+# BraTS-GLI images: [B, 4, H, W] in T1n, T1c, T2w, T2f order
+# logits: [B, 3, H, W] for overlapping WT, TC, ET regions
 logits = model(images)
 
-# labels: [B, H, W]
-results = evaluate(logits, labels)
+# targets: [B, 3, H, W] multi-hot masks; use sigmoid-style outputs
+results = evaluate(logits, targets)
 ```
 
 The final number of input channels and segmentation outputs will depend on our selected BraTS configuration.
@@ -245,6 +245,19 @@ CAP6411-Adaptive-Token-Merging/
 Only source code, configurations, small result tables/plots, and documentation belong in GitHub.
 
 Datasets and large model checkpoints remain in private storage.
+
+### Workstream 1 handoff
+
+The completed BraTS/DINOv3 baseline handoff and token-merging boundary are
+documented in:
+
+- [`docs/WORKSTREAM1_HANDOFF.md`](docs/WORKSTREAM1_HANDOFF.md)
+- [`docs/TOKEN_MERGING_INTEGRATION.md`](docs/TOKEN_MERGING_INTEGRATION.md)
+- [`notebooks/CAP6411_Workstream1_Setup.ipynb`](notebooks/CAP6411_Workstream1_Setup.ipynb)
+
+The notebook is sanitized and contains no private data, credentials, weights,
+checkpoints, or saved execution output. Authorized teammates must obtain BraTS
+and gated DINOv3 weights independently.
 
 For a local editable setup, create and activate a virtual environment, then run:
 

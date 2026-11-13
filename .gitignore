@@ -27,11 +27,22 @@ env/
 *.key
 credentials*.json
 secrets*.json
+client_secret*.json
+token*.json
+application_default_credentials.json
+.huggingface/
 
 # Datasets and local data
 data/**
 !data/.gitkeep
 datasets/
+*.nii
+*.nii.gz
+*.tar
+*.tar.gz
+*.zip
+*.npy
+*.npz
 
 # Model weights and checkpoints
 checkpoints/
@@ -40,6 +51,8 @@ weights/
 *.pth
 *.pt
 *.safetensors
+*.bin
+*.onnx
 
 # Generated experiment artifacts
 outputs/**
@@ -49,6 +62,9 @@ wandb/
 mlruns/
 lightning_logs/
 tensorboard/
+cache/
+*_cache/
+brats_cache/
 
 # Notebook-generated state
 .ipynb_checkpoints/

@@ -1,1 +1,1 @@
-"""Data loading and preprocessing interfaces."""
+"""Data loading, inspection, and preprocessing interfaces."""
