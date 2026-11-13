@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 import torch
 from torch import nn
@@ -15,6 +16,7 @@ from cap6411_atm.training.baseline import (
     BaselineTrainingConfig,
     TrainingComponents,
     _make_scaler,
+    build_training_components,
     fit,
     resume_from_checkpoint,
     run_one_batch_smoke_test,
@@ -56,6 +58,35 @@ class SyntheticSlices(Dataset):
             "patient_id": patient_id,
             "slice_index": slice_index,
             "split": "train",
+        }
+
+
+class SyntheticSplitSlices(Dataset):
+    """Tiny split fixture with the dataset attributes used by the trainer."""
+
+    def __init__(self, split: str, *, cache_dir=None, **kwargs) -> None:
+        del kwargs
+        self.cache_dir = cache_dir
+        prefix = "train" if split == "train" else "validation"
+        count = 2 if split == "train" else 1
+        self.patient_ids = tuple(f"{prefix}-{index}" for index in range(count))
+        self.samples = tuple(
+            (patient_id, index)
+            for patient_id in self.patient_ids
+            for index in range(2)
+        )
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int):
+        patient_id, slice_index = self.samples[index]
+        return {
+            "image": torch.zeros(4, 8, 8),
+            "target": torch.zeros(3, 8, 8),
+            "patient_id": patient_id,
+            "slice_index": slice_index,
+            "split": patient_id.split("-", 1)[0],
         }
 
 
@@ -146,6 +177,57 @@ def make_components() -> TrainingComponents:
 
 
 class BaselineTrainingTests(unittest.TestCase):
+    def test_training_components_disable_disk_cache_without_creating_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = make_config(
+                root,
+                cache_dir=None,
+                pilot_enabled=False,
+                model_config=str(root / "model.json"),
+            )
+            created_datasets = []
+
+            def dataset_factory(*args, **kwargs):
+                dataset = SyntheticSplitSlices(args[2], **kwargs)
+                created_datasets.append(dataset)
+                return dataset
+
+            with (
+                mock.patch(
+                    "cap6411_atm.training.baseline.DINOv3SegmentationConfig.from_json",
+                    return_value=TinyModelConfig(),
+                ),
+                mock.patch(
+                    "cap6411_atm.training.baseline.build_pretrained_brats_dinov3",
+                    return_value=TinySegmenter(),
+                ),
+                mock.patch(
+                    "cap6411_atm.training.baseline.BraTSAxialSliceDataset",
+                    side_effect=dataset_factory,
+                ),
+            ):
+                components = build_training_components(config)
+
+            self.assertEqual(len(created_datasets), 2)
+            self.assertTrue(all(dataset.cache_dir is None for dataset in created_datasets))
+            self.assertEqual(list(root.iterdir()), [])
+            self.assertEqual(components.dataset_metadata["train_patient_count"], 2)
+            self.assertEqual(components.dataset_metadata["validation_patient_count"], 1)
+
+    def test_full_cohort_configuration_is_storage_safe(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = BaselineTrainingConfig.from_json(
+            root / "configs" / "brats2023_gli_full_cohort_training.json"
+        )
+        self.assertFalse(config.pilot_enabled)
+        self.assertIsNone(config.cache_dir)
+        self.assertEqual(config.batch_size, 2)
+        self.assertTrue(config.amp)
+        self.assertEqual(config.epochs, 1)
+        self.assertEqual(config.max_cached_patients, 1)
+        self.assertIn("full_cohort", config.output_dir)
+
     def test_loss_is_finite_and_propagates_gradients(self) -> None:
         logits = torch.zeros(2, 3, 8, 8, requires_grad=True)
         targets = torch.zeros_like(logits)

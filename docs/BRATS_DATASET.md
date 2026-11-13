@@ -68,6 +68,14 @@ its compressed ZIP members, so populate it on demand rather than caching the
 entire cohort. Multiple DataLoader workers have independent in-memory caches;
 the disk-cache write uses a temporary directory and atomic rename.
 
+For a full-cohort pass on a storage-constrained Colab runtime, set
+`cache_dir=None` (JSON: `"cache_dir": null`). This disables persistent `.npy`
+files entirely while preserving the bounded per-process in-memory LRU cache
+controlled by `max_cached_patients`. Patient-local sampling still prevents a
+patient from being repeatedly decompressed while its slices are consumed. The
+tradeoff is that the same patient must be decompressed and normalized again in
+a later epoch or a new runtime.
+
 For best locality, avoid fully random slice ordering across the entire cohort.
 Sampling nearby slices from the same patient reduces ZIP decompression and cache
 thrashing. Start with `num_workers=0` while validating the pipeline, then tune

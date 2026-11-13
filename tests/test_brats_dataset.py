@@ -205,6 +205,28 @@ class BraTSDatasetTests(unittest.TestCase):
         self.assertTrue(torch.equal(first_sample["image"], second_sample["image"]))
         self.assertTrue((cache_dir / first_sample["patient_id"] / "metadata.json").is_file())
 
+    def test_disabled_disk_cache_keeps_only_bounded_memory_cache(self) -> None:
+        folders = [self._write_patient(patient_id) for patient_id in self.patient_ids]
+        archive = self._zip(folders)
+        manifest_path, manifest = self._manifest()
+        split = next(name for name, ids in manifest["splits"].items() if ids)
+        files_before = set(self.root.iterdir())
+        dataset = self._dataset(
+            archive,
+            manifest_path,
+            split,
+            slice_indices=[2],
+            cache_dir=None,
+            max_cached_patients=1,
+        )
+
+        sample = dataset[0]
+
+        self.assertEqual(set(self.root.iterdir()), files_before)
+        self.assertIsNone(dataset.cache_dir)
+        self.assertEqual(list(dataset._memory_cache), [sample["patient_id"]])
+        self.assertEqual(len(dataset._memory_cache), 1)
+
 
 MODALITY_OFFSETS = {"t1": 0, "t1ce": 10, "t2": 20, "flair": 30}
 

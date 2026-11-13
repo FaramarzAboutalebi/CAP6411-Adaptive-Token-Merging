@@ -67,6 +67,32 @@ is only the initial T4 setting; use smoke-test peak memory to decide whether it
 must be reduced or can be increased. Actual T4 capacity is not claimed until
 measured on a T4.
 
+For the verified 876-patient train and 187-patient validation splits, use the
+separate storage-safe configuration:
+
+```bash
+python -m cap6411_atm.training.baseline \
+  --config configs/brats2023_gli_full_cohort_training.json \
+  --smoke-test
+
+python -m cap6411_atm.training.baseline \
+  --config configs/brats2023_gli_full_cohort_training.json
+```
+
+It runs one full-cohort epoch initially, retains batch size 2 and CUDA AMP, sets
+`pilot_enabled` to false, and writes checkpoints under the distinct Google
+Drive directory
+`CAP6411/checkpoints/full_cohort/dinov3_vitb16_brats_full_cohort/`. Its
+`"cache_dir": null` setting passes `cache_dir=None` to both datasets, so no
+persistent normalized `.npy` cache accumulates on Colab's local disk. The
+one-patient in-memory LRU remains active through `max_cached_patients: 1`.
+Increase `epochs` only after the first epoch and checkpoint complete
+successfully; later epochs will decompress and normalize patients again.
+Setting `cache_dir` to null prevents new persistent caches but does not remove a
+cache left by an earlier run. Start from the reset/clean Colab runtime or inspect
+and remove the old `/content/brats_cache` separately before launching the full
+cohort command.
+
 Each epoch records measured train/validation throughput and estimates the
 corresponding full-split epoch duration. The sampler shuffles patient order and
 slices deterministically while keeping every batch within one patient. With the

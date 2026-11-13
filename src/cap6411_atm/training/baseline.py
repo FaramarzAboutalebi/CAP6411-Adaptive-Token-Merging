@@ -47,7 +47,7 @@ class BaselineTrainingConfig:
     batch_size: int = 2
     num_workers: int = 0
     max_cached_patients: int = 1
-    cache_dir: str = "/content/brats_cache"
+    cache_dir: str | None = "/content/brats_cache"
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     bce_weight: float = 0.5
@@ -171,13 +171,13 @@ def build_training_components(config: BaselineTrainingConfig) -> TrainingCompone
         model_config,
     ).to(device)
 
-    cache_root = Path(config.cache_dir)
+    cache_root = Path(config.cache_dir) if config.cache_dir is not None else None
     train_full = BraTSAxialSliceDataset(
         config.archive_path,
         config.manifest_path,
         "train",
         config.inspection_config,
-        cache_dir=cache_root / "train",
+        cache_dir=cache_root / "train" if cache_root is not None else None,
         max_cached_patients=config.max_cached_patients,
     )
     validation_full = BraTSAxialSliceDataset(
@@ -185,7 +185,7 @@ def build_training_components(config: BaselineTrainingConfig) -> TrainingCompone
         config.manifest_path,
         "validation",
         config.inspection_config,
-        cache_dir=cache_root / "validation",
+        cache_dir=cache_root / "validation" if cache_root is not None else None,
         max_cached_patients=config.max_cached_patients,
     )
     if set(train_full.patient_ids) & set(validation_full.patient_ids):
