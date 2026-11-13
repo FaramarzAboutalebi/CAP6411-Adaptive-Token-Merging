@@ -16,6 +16,7 @@ from cap6411_atm.training.baseline import (
     BaselineTrainingConfig,
     TrainingComponents,
     _make_scaler,
+    _restore_rng_state,
     build_training_components,
     fit,
     resume_from_checkpoint,
@@ -177,6 +178,48 @@ def make_components() -> TrainingComponents:
 
 
 class BaselineTrainingTests(unittest.TestCase):
+    def test_rng_restoration_moves_cuda_mapped_states_to_cpu(self) -> None:
+        python_state = object()
+        numpy_state = object()
+        cpu_torch_state = torch.zeros(16, dtype=torch.uint8)
+        cpu_cuda_states = [
+            torch.ones(16, dtype=torch.uint8),
+            torch.full((16,), 2, dtype=torch.uint8),
+        ]
+        mapped_torch_state = mock.Mock()
+        mapped_torch_state.cpu.return_value = cpu_torch_state
+        mapped_cuda_states = [mock.Mock(), mock.Mock()]
+        for mapped, cpu_state in zip(mapped_cuda_states, cpu_cuda_states):
+            mapped.cpu.return_value = cpu_state
+
+        state = {
+            "python": python_state,
+            "numpy": numpy_state,
+            "torch": mapped_torch_state,
+            "cuda": mapped_cuda_states,
+        }
+        with (
+            mock.patch("cap6411_atm.training.baseline.random.setstate") as set_python,
+            mock.patch("cap6411_atm.training.baseline.np.random.set_state") as set_numpy,
+            mock.patch("cap6411_atm.training.baseline.torch.set_rng_state") as set_torch,
+            mock.patch(
+                "cap6411_atm.training.baseline.torch.cuda.is_available",
+                return_value=True,
+            ),
+            mock.patch(
+                "cap6411_atm.training.baseline.torch.cuda.set_rng_state_all"
+            ) as set_cuda,
+        ):
+            _restore_rng_state(state)
+
+        set_python.assert_called_once_with(python_state)
+        set_numpy.assert_called_once_with(numpy_state)
+        mapped_torch_state.cpu.assert_called_once_with()
+        set_torch.assert_called_once_with(cpu_torch_state)
+        for mapped in mapped_cuda_states:
+            mapped.cpu.assert_called_once_with()
+        set_cuda.assert_called_once_with(cpu_cuda_states)
+
     def test_training_components_disable_disk_cache_without_creating_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

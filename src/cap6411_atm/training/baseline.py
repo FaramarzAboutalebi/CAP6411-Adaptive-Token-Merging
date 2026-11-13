@@ -481,9 +481,11 @@ def _rng_state() -> dict[str, Any]:
 def _restore_rng_state(state: dict[str, Any]) -> None:
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch"])
+    torch.set_rng_state(state["torch"].cpu())
     if state.get("cuda") is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
+        torch.cuda.set_rng_state_all(
+            [rng_state.cpu() for rng_state in state["cuda"]]
+        )
 
 
 def _checkpoint_payload(
