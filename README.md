@@ -246,6 +246,19 @@ Only source code, configurations, small result tables/plots, and documentation b
 
 Datasets and large model checkpoints remain in private storage.
 
+### Workstream 1 handoff
+
+The completed BraTS/DINOv3 baseline handoff and token-merging boundary are
+documented in:
+
+- [`docs/WORKSTREAM1_HANDOFF.md`](docs/WORKSTREAM1_HANDOFF.md)
+- [`docs/TOKEN_MERGING_INTEGRATION.md`](docs/TOKEN_MERGING_INTEGRATION.md)
+- [`notebooks/CAP6411_Workstream1_Setup.ipynb`](notebooks/CAP6411_Workstream1_Setup.ipynb)
+
+The notebook is sanitized and contains no private data, credentials, weights,
+checkpoints, or saved execution output. Authorized teammates must obtain BraTS
+and gated DINOv3 weights independently.
+
 For a local editable setup, create and activate a virtual environment, then run:
 
 ```bash

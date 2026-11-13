@@ -6,12 +6,12 @@ Workstream 1 provides a reproducible 2D axial BraTS 2023 Adult Glioma
 segmentation baseline built around a frozen official DINOv3 ViT-B/16 encoder.
 The data inspection, patient splitting, preprocessing, dataset, model, training,
 checkpointing, and validation-metric interfaces are implemented in this
-repository. Two small-data pilot experiments have been completed externally in
-Google Colab; their fair-comparison results are recorded below.
+repository. Two pilot experiments and two full-cohort epochs have been
+completed in Google Colab; their validation results are recorded below.
 
-This is a **pilot handoff**, not a full-cohort or independent-test result. The
-validation split was used for checkpoint selection, and the isolated test split
-has not been evaluated.
+This is a **validation handoff**, not an independent-test result. Validation
+was used for checkpoint selection, and the isolated test split has not been
+evaluated.
 
 ## 1. Dataset and target contract
 
@@ -104,8 +104,9 @@ and segmentation labels.
 
 Patients are read individually from the ZIP. Only one patient's files are
 temporarily extracted at a time. The patient-local batch sampler keeps every
-batch within one patient, and the bounded memory/disk cache avoids repeatedly
-decompressing that patient. Colab's default cache is `/content/brats_cache`.
+batch within one patient. Pilot runs may use a bounded disk cache; full-cohort
+training uses `cache_dir: null` to prevent normalized patient arrays from
+exhausting Colab storage while retaining the one-patient in-memory LRU.
 
 ### Optimization defaults
 
@@ -190,159 +191,110 @@ validation patient, false-positive ET pixels decreased from 52,011 to 17,878:
 (52,011 - 17,878) / 52,011 = 0.6563 ≈ 65.6% reduction
 ```
 
-The recommended pilot checkpoint is:
+## 5. Completed full-cohort baseline
 
-```text
-My Drive/CAP6411/checkpoints/dinov3_vitb16_brats_pilot32/best.pt
-```
+The full-cohort run used the official frozen DINOv3 ViT-B/16 backbone, trainable
+MRI adapter and decoder, batch size 2, AdamW, CUDA AMP, and persistent disk
+caching disabled. It trained on all 876 training patients and validated on all
+187 validation patients. Two epochs completed.
 
-In a mounted Colab Drive, its path is:
+| Validation metric | Epoch 1 | Epoch 2 |
+|---|---:|---:|
+| WT Dice | 0.84847853 | 0.86898142 |
+| TC Dice | 0.81595193 | 0.85647742 |
+| ET Dice | 0.71793982 | 0.73206816 |
+| Macro Dice | 0.79412342 | 0.81917567 |
 
-```text
-/content/drive/MyDrive/CAP6411/checkpoints/dinov3_vitb16_brats_pilot32/best.pt
-```
+These are global thresholded **validation** Dice values from the repository's
+`StreamingDice` implementation. They are not test results. The 188-patient test
+split remains isolated and unevaluated.
 
-The checkpoint's embedded `training_config`, `model_config`,
-`dataset_metadata`, and `history` are the authoritative record for its exact
-run configuration and selected patients.
+Trained checkpoints are not distributed through GitHub. An authorized teammate
+may receive a checkpoint through the team's approved private storage, subject
+to the DINOv3 and dataset access terms. The checkpoint's embedded
+`training_config`, `model_config`, `dataset_metadata`, and `history` remain the
+authoritative record for its run.
 
-## 5. Load and evaluate the recommended checkpoint
+## 6. Reproducible setup, checkpoint loading, and validation
 
-Run the following from the repository root in Colab. It uses only existing
-repository APIs and evaluates exactly the validation patient IDs stored in the
-checkpoint. Only load a checkpoint you trust because it is deserialized by
-PyTorch.
-
-First mount Drive, install the package, and pin the official source checkout:
-
-```python
-from google.colab import drive
-
-drive.mount("/content/drive")
-```
+Create a Python 3.10+ environment, install a platform-appropriate PyTorch build,
+then install this repository:
 
 ```bash
-%%bash
-cd /content/dinov3
-git checkout 6876159a11b4df116f30f667f8c9888617df0751
-
-cd /content/CAP6411-Adaptive-Token-Merging
-pip install -e .
+python -m pip install -r requirements.txt
+python -m pip install -e . --no-deps
+python -m unittest discover -s tests -v
 ```
 
-Then load the model and evaluate the checkpoint's stored validation cohort:
+Clone the official DINOv3 source and pin the audited revision:
+
+```bash
+git clone https://github.com/facebookresearch/dinov3.git /path/to/dinov3
+git -C /path/to/dinov3 checkout 6876159a11b4df116f30f667f8c9888617df0751
+python -m pip install -e /path/to/dinov3 --no-deps
+python -m pip install ftfy omegaconf regex scikit-learn submitit termcolor torchmetrics
+```
+
+Request the gated ViT-B/16 LVD-1689M checkpoint through Meta's official DINOv3
+access process. The required filename is
+`dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth`. Do not share download URLs,
+tokens, or weight files. Obtain BraTS 2023 GLI through its authorized channel
+and keep the ZIP and patient manifest outside the repository.
+
+The sanitized notebook
+`notebooks/CAP6411_Workstream1_Setup.ipynb` provides executable, guarded cells
+for configuring local private paths, loading the dataset and authorized
+weights, running validation, and resuming training. It contains no saved output
+or private path.
+
+To load an authorized trained checkpoint, construct the official backbone with
+`build_pretrained_brats_dinov3(...)`, then restore the strict model state:
 
 ```python
-from dataclasses import asdict
-from pathlib import Path
-
 import torch
-from torch.utils.data import DataLoader
-
-from cap6411_atm.data.dataset import BraTSAxialSliceDataset
 from cap6411_atm.models import (
     DINOv3SegmentationConfig,
     build_pretrained_brats_dinov3,
 )
-from cap6411_atm.training.metrics import StreamingDice
-from cap6411_atm.training.sampling import PatientLocalBatchSampler, PatientSubset
 
-REPO = Path("/content/CAP6411-Adaptive-Token-Merging")
-ARCHIVE = Path(
-    "/content/drive/MyDrive/CAP6411/datasets/"
-    "ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData.zip"
-)
-MANIFEST = Path("/content/drive/MyDrive/CAP6411/brats2023_gli_split_seed42.json")
-PRETRAINED = Path(
-    "/content/drive/MyDrive/CAP6411/checkpoints/"
-    "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
-)
-TRAINED = Path(
-    "/content/drive/MyDrive/CAP6411/checkpoints/"
-    "dinov3_vitb16_brats_pilot32/best.pt"
-)
-DINOV3_REPOSITORY = Path("/content/dinov3")
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# This is a trusted project checkpoint. The fallback supports older PyTorch.
-try:
-    checkpoint = torch.load(TRAINED, map_location="cpu", weights_only=False)
-except TypeError:
-    checkpoint = torch.load(TRAINED, map_location="cpu")
-
-assert checkpoint["dataset_metadata"]["test_split_loaded"] is False
-validation_ids = tuple(checkpoint["dataset_metadata"]["validation_patients"])
-assert len(validation_ids) == 8
-
-model_config = DINOv3SegmentationConfig.from_json(
-    REPO / "configs/dinov3_vitb16_brats.json"
-)
-assert checkpoint["model_config"] == asdict(model_config)
-
+config = DINOv3SegmentationConfig.from_json("configs/dinov3_vitb16_brats.json")
 model = build_pretrained_brats_dinov3(
-    repository=DINOV3_REPOSITORY,
-    checkpoint=PRETRAINED,
-    config=model_config,
+    repository="/path/to/dinov3",
+    checkpoint="/private/path/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+    config=config,
 )
+checkpoint = torch.load(
+    "/private/path/trained_checkpoint.pt",
+    map_location="cpu",
+    weights_only=False,
+)
+assert checkpoint["dataset_metadata"]["test_split_loaded"] is False
 model.load_state_dict(checkpoint["model_state"], strict=True)
-model.to(device).eval()
-
-validation_full = BraTSAxialSliceDataset(
-    archive_path=ARCHIVE,
-    manifest_path=MANIFEST,
-    split="validation",
-    inspection_config=REPO / "configs/brats2023_gli_inspection.json",
-    cache_dir="/content/brats_cache/validation",
-    max_cached_patients=1,
-)
-assert set(validation_ids).issubset(set(validation_full.patient_ids))
-validation = PatientSubset(validation_full, validation_ids)
-sampler = PatientLocalBatchSampler(
-    validation,
-    batch_size=2,
-    seed=42,
-    shuffle_patients=False,
-    shuffle_slices=False,
-)
-loader = DataLoader(
-    validation,
-    batch_sampler=sampler,
-    num_workers=0,
-    pin_memory=device.type == "cuda",
-)
-
-threshold = float(checkpoint["training_config"]["validation_threshold"])
-metric = StreamingDice(threshold=threshold)
-
-with torch.inference_mode():
-    for batch in loader:
-        images = batch["image"].to(device, non_blocking=True)
-        targets = batch["target"].to(device, non_blocking=True)
-        with torch.autocast(
-            device_type=device.type,
-            dtype=torch.float16,
-            enabled=device.type == "cuda",
-        ):
-            logits = model(images)
-        metric.update(logits, targets)
-
-results = metric.compute()
-print(results)
+model.eval()
 ```
 
-For segmentation masks from an individual batch, apply independent sigmoid
-thresholds to the raw logits:
+Use `BraTSAxialSliceDataset` with `split="validation"`, the checkpoint's stored
+`validation_patients`, `PatientSubset`, `PatientLocalBatchSampler`, and
+`StreamingDice` to reproduce validation. Use `cache_dir=None` for full-cohort
+work. Apply sigmoid only for independent WT/TC/ET probabilities or thresholded
+masks; the model returns raw logits.
 
-```python
-probabilities = torch.sigmoid(logits.float())
-predicted_wt_tc_et = probabilities >= threshold  # bool [B, 3, 240, 240]
+To resume without repeating completed epochs, set the runtime configuration's
+`epochs` to the desired total and invoke:
+
+```bash
+python -m cap6411_atm.training.baseline \
+  --config /private/runtime/full_cohort_resume.json \
+  --resume /private/checkpoints/full_cohort/last.pt
 ```
 
-The three heads are independent; the implementation does not post-process them
-to force `ET ⊆ TC ⊆ WT`.
+`resume_from_checkpoint` returns `checkpoint["epoch"] + 1`, restores model,
+optimizer, AMP scaler, history, and Python/NumPy/PyTorch RNG state, and therefore
+starts after the last completed zero-based epoch. The runtime config must keep
+the same seed, pilot settings, manifest, and archive. Never edit or recommit the
+private checkpoint.
 
-## 6. Adaptive token-merging integration guidance
+## 7. Adaptive token-merging integration guidance
 
 There is currently no merger or reconstructor implementation:
 `src/cap6411_atm/merging/__init__.py` is a placeholder. Do not invent an
@@ -387,15 +339,18 @@ inter-block merging, a block-level wrapper, and a defensible treatment of
 DINOv3 rotary spatial positions for merged regions. The unmodified
 `get_intermediate_layers` path does not provide that functionality.
 
-## 7. Limitations and claims boundary
+## 8. Limitations and claims boundary
 
-- Both experiments are small-data pilots, not full 876-patient training runs.
-- Validation data was used for best-checkpoint selection.
+- Two full-cohort epochs completed, but this remains an early baseline rather
+  than a converged training study.
+- Validation data was used for checkpoint selection and model-development
+  comparisons.
 - The fair comparison reused the same eight validation patients; it is not an
   independent evaluation.
 - The isolated 188-patient test split has not been evaluated and must remain
   untouched until the final model and evaluation protocol are fixed.
-- The results do not establish full-cohort or external-dataset generalization.
+- The results do not establish independent-test or external-dataset
+  generalization.
 - The repository's `StreamingDice` implementation computes global thresholded
   Dice, not patient-averaged Dice. The pilot table should retain its supplied
   provenance unless it is recomputed from the saved checkpoints with the
@@ -405,7 +360,7 @@ DINOv3 rotary spatial positions for merged regions. The unmodified
 - Patch-16 features may limit small-lesion and boundary accuracy, especially ET.
 - No adaptive token-merging speedup or accuracy claim has yet been established.
 
-Any presentation or report should label the table as a **same-eight-patient
-validation comparison of two pilot models** and identify the 32-patient model's
-`best.pt` as the recommended pilot checkpoint, not as a final test-qualified
-model.
+Any presentation or report must label the pilot comparison as a
+**same-eight-patient validation comparison** and the full-cohort table as
+**187-patient validation results after two epochs**. Neither is a final
+test-qualified result.
