@@ -15,6 +15,8 @@ Use these source files:
 - `src/cap6411_atm/training/metrics.py` — global thresholded WT/TC/ET Dice.
 - `configs/dinov3_vitb16_brats.json` — audited backbone/decoder dimensions.
 - `tests/test_dinov3_segmentation.py` — weight-free synthetic backbone fixture.
+- `docs/WORKSTREAM1_ARTIFACTS.md` — restricted trained-weight artifact,
+  checksum, loading procedure, and access boundary.
 
 The stable model calls are:
 
@@ -83,6 +85,12 @@ python -m unittest discover -s tests -v
 expected intermediate-feature and special-token interface. It allows merger,
 reconstructor, decoder, shape, and gradient development without the BraTS ZIP,
 official gated weights, or a trained checkpoint.
+
+When trained comparisons are needed, construct the official backbone from each
+teammate's independently authorized checkpoint, then use
+`load_adapter_decoder_artifact(...)` with the restricted Workstream 1 artifact.
+The loader does not replace or modify encoder weights. Never add either the
+official checkpoint or the trained artifact to Git.
 
 ## Acceleration claims boundary
 

@@ -252,6 +252,7 @@ The completed BraTS/DINOv3 baseline handoff and token-merging boundary are
 documented in:
 
 - [`docs/WORKSTREAM1_HANDOFF.md`](docs/WORKSTREAM1_HANDOFF.md)
+- [`docs/WORKSTREAM1_ARTIFACTS.md`](docs/WORKSTREAM1_ARTIFACTS.md)
 - [`docs/TOKEN_MERGING_INTEGRATION.md`](docs/TOKEN_MERGING_INTEGRATION.md)
 - [`notebooks/CAP6411_Workstream1_Setup.ipynb`](notebooks/CAP6411_Workstream1_Setup.ipynb)
 

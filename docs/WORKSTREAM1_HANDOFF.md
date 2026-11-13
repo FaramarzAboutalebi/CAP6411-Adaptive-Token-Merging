@@ -209,11 +209,13 @@ These are global thresholded **validation** Dice values from the repository's
 `StreamingDice` implementation. They are not test results. The 188-patient test
 split remains isolated and unevaluated.
 
-Trained checkpoints are not distributed through GitHub. An authorized teammate
-may receive a checkpoint through the team's approved private storage, subject
-to the DINOv3 and dataset access terms. The checkpoint's embedded
-`training_config`, `model_config`, `dataset_metadata`, and `history` remain the
-authoritative record for its run.
+Trained checkpoints are not distributed through GitHub. The recommended team
+artifact is the sanitized adapter/decoder-only export documented in
+`docs/WORKSTREAM1_ARTIFACTS.md`. It excludes the official DINOv3 backbone,
+optimizer/scaler/RNG state, patient identifiers, and private paths. Authorized
+teammates obtain it from restricted team storage and obtain the official gated
+backbone independently. The full training checkpoint remains private and is
+needed only for exact training resume.
 
 ## 6. Reproducible setup, checkpoint loading, and validation
 
@@ -232,7 +234,7 @@ Clone the official DINOv3 source and pin the audited revision:
 git clone https://github.com/facebookresearch/dinov3.git /path/to/dinov3
 git -C /path/to/dinov3 checkout 6876159a11b4df116f30f667f8c9888617df0751
 python -m pip install -e /path/to/dinov3 --no-deps
-python -m pip install ftfy omegaconf regex scikit-learn submitit termcolor torchmetrics
+python -m pip install -r /path/to/dinov3/requirements.txt
 ```
 
 Request the gated ViT-B/16 LVD-1689M checkpoint through Meta's official DINOv3
@@ -272,6 +274,22 @@ assert checkpoint["dataset_metadata"]["test_split_loaded"] is False
 model.load_state_dict(checkpoint["model_state"], strict=True)
 model.eval()
 ```
+
+For inference and token-merging integration, prefer the smaller sanitized
+artifact rather than the full checkpoint:
+
+```python
+from cap6411_atm.models import load_adapter_decoder_artifact
+
+metadata = load_adapter_decoder_artifact(
+    model,
+    "/restricted/team/path/dinov3_vitb16_brats_epoch2_adapter_decoder.pt",
+)
+model.eval()
+```
+
+See `docs/WORKSTREAM1_ARTIFACTS.md` for its checksum, security boundary,
+authorized access requirements, export procedure, and inference example.
 
 Use `BraTSAxialSliceDataset` with `split="validation"`, the checkpoint's stored
 `validation_patients`, `PatientSubset`, `PatientLocalBatchSampler`, and
