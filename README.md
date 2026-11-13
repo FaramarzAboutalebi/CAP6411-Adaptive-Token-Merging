@@ -23,17 +23,32 @@ We will compare four approaches:
 
 Our main metrics will include Dice score, boundary quality, inference latency, and peak GPU memory.
 
-The exact BraTS release, MRI modalities, model configuration, and evaluation protocol will be agreed upon before experiments.
+Workstream 1 uses the BraTS 2023 Adult Glioma (BraTS-GLI) dataset with T1n,
+T1c, T2w, and T2f MRI modalities. The implemented baseline uses a frozen
+official DINOv3 ViT-B/16 encoder, a trainable four-to-three-channel MRI
+adapter, and a lightweight WT/TC/ET segmentation decoder.
 
-## Team — Choose Your Workstream
+**Current status:** Dataset inspection, patient-level splitting, preprocessing,
+the DINOv3 segmentation baseline, checkpoint resume, and two full-cohort
+training epochs are complete. The best completed full-cohort validation Macro
+Dice is **0.819175669195643** on the 187-patient validation split. This is
+validation performance, not independent-test performance; the 188-patient test
+split remains isolated and unevaluated. Adaptive token merging, standardized
+efficiency benchmarking, method comparisons, and final evaluation remain
+planned work.
 
-We have four technical workstreams. **Each member chooses one primary role.** No roles are assigned yet.
+## Team — Workstreams and Status
+
+We have four technical workstreams. Each member contributes implementation,
+testing, experiments, documentation, and material for the final report and
+presentation. Workstream 1 is complete; assignments for the remaining
+workstreams are not recorded here.
 
 Each role includes implementation, testing, experiments, documentation, and contributing to the final report and presentation.
 
 | Workstream | Selection |
 |---|---|
-| Dataset & segmentation baseline | Unassigned |
+| Dataset & segmentation baseline | Completed |
 | Adaptive token merging | Unassigned |
 | Efficiency & baseline comparisons | Unassigned |
 | Segmentation evaluation & ablations | Unassigned |
@@ -41,6 +56,10 @@ Each role includes implementation, testing, experiments, documentation, and cont
 ### Role 1 — Dataset & Segmentation Baseline
 
 **Goal:** Build a working uncompressed segmentation model.
+
+**Status:** Completed for the BraTS 2023 GLI frozen-DINOv3 baseline. Broader
+latency and memory comparisons across merging methods remain part of
+Workstream 3.
 
 Tasks:
 - Obtain and prepare the selected BraTS dataset.
@@ -115,11 +134,12 @@ Tasks:
 
 ## How We Work in Parallel
 
-Nobody needs to wait for the entire baseline to be completed.
+The completed Workstream 1 baseline provides the stable integration boundary;
+the remaining workstreams can continue in parallel against it.
 
 | Role | Start immediately with | Integrate later with |
 |---|---|---|
-| 1 | BraTS preparation and baseline setup | Shared model interface |
+| 1 | Completed BraTS preparation and baseline | Support shared model interface |
 | 2 | Synthetic token tensors and a standalone ViT | Role 1's encoder |
 | 3 | Dummy model and benchmarking tools | All model variants |
 | 4 | Synthetic predictions and sample masks | Real model predictions |
@@ -139,12 +159,13 @@ logits = model(images)
 results = evaluate(logits, targets)
 ```
 
-The final number of input channels and segmentation outputs will depend on our selected BraTS configuration.
+The implemented contract uses four input modalities and three overlapping
+segmentation outputs exactly as shown above.
 
 All methods must use compatible preprocessing, splits, prediction formats, and evaluation settings.
 
 **Integration checkpoints:**
-- Role 1 shares a minimal model interface early.
+- Workstream 1 exposes the completed model and feature interfaces.
 - Role 2 tests encoder compatibility before implementing advanced merging.
 - Roles 3 and 4 validate their tools independently with mock data.
 - Everyone integrates through reviewed pull requests.
@@ -176,21 +197,12 @@ from google.colab import drive
 drive.mount("/content/drive")
 ```
 
-For this private repository, create a fine-grained GitHub personal access token with read-only access to this repository, save it in Colab Secrets as `GITHUB_TOKEN`, and use an HTTP authorization header so the token is not written into the clone URL or notebook:
+The repository is public, so a fresh Colab runtime can clone it without a
+GitHub credential:
 
-```python
-from google.colab import userdata
-import subprocess
-
-token = userdata.get("GITHUB_TOKEN")
-subprocess.run(
-    [
-        "git", "-c", f"http.extraHeader=Authorization: Bearer {token}",
-        "clone", "https://github.com/FaramarzAboutalebi/CAP6411-Adaptive-Token-Merging.git",
-    ],
-    check=True,
-)
-del token
+```bash
+git clone --branch main \
+  https://github.com/FaramarzAboutalebi/CAP6411-Adaptive-Token-Merging.git
 ```
 
 ```python
@@ -199,7 +211,13 @@ del token
 !pip install -e . --no-deps
 ```
 
-Grant the notebook access to the secret only when prompted. Never print the token, place it directly in a URL, save it in a notebook, or commit it. Team members with repository access may use an equivalent GitHub App or SSH credential flow.
+No GitHub token is needed for cloning or pulling the public repository. Use an
+approved SSH key, credential manager, or fine-grained token only when an
+authorized contributor needs to push; never print credentials, embed them in a
+URL or notebook, or commit them. Public repository access does not grant access
+to BraTS data, official gated DINOv3 weights, or trained artifacts. Obtain
+those assets through their authorized channels and keep them in restricted
+storage.
 
 **Important:**
 - Colab runtime storage is temporary.
@@ -256,9 +274,15 @@ documented in:
 - [`docs/TOKEN_MERGING_INTEGRATION.md`](docs/TOKEN_MERGING_INTEGRATION.md)
 - [`notebooks/CAP6411_Workstream1_Setup.ipynb`](notebooks/CAP6411_Workstream1_Setup.ipynb)
 
-The notebook is sanitized and contains no private data, credentials, weights,
-checkpoints, or saved execution output. Authorized teammates must obtain BraTS
-and gated DINOv3 weights independently.
+The notebook preserves the original experiment, debugging, training, and
+checkpoint-resume history. Direct MRI figure payloads, credentials, weights,
+and dataset binaries are not included. Authorized teammates must obtain BraTS,
+the gated DINOv3 backbone, and restricted trained artifacts through the
+documented access process.
+
+The two-epoch full-cohort baseline reached validation Macro Dice
+`0.819175669195643`. This is the selected validation result, not an independent
+test result.
 
 For a local editable setup, create and activate a virtual environment, then run:
 
@@ -325,7 +349,7 @@ Suggested branch names:
 
 We aim to deliver:
 
-- [ ] Reproducible DINOv3 + BraTS segmentation baseline
+- [x] Reproducible DINOv3 + BraTS segmentation baseline
 - [ ] Working uniform token merging
 - [ ] Working adaptive token merging
 - [ ] Reduced-resolution comparison
