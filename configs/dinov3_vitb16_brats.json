@@ -1,0 +1,15 @@
+{
+  "checkpoint_filename": "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+  "decoder_channels": [128, 96, 64, 32],
+  "dinov3_revision": "6876159a11b4df116f30f667f8c9888617df0751",
+  "embedding_dim": 768,
+  "encoder_channels": 3,
+  "feature_blocks": [2, 5, 8, 11],
+  "input_channels": 4,
+  "input_size": [240, 240],
+  "lateral_channels": 128,
+  "output_channels": 3,
+  "patch_size": 16,
+  "storage_tokens": 4,
+  "transformer_blocks": 12
+}
