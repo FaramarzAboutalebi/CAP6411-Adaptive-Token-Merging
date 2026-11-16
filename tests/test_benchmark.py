@@ -609,5 +609,101 @@ class PeerReviewRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(row["peak_memory_variant_mb"], clean["peak_memory_variant_mb"], delta=1.0)
 
 
+class ThirdReviewRegressionTests(unittest.TestCase):
+    """Guards for issues 1-6 from the third review."""
+
+    ENV = {"gpu": "NVIDIA GeForce RTX 5090", "nvidia_driver": "575.51", "cuda_runtime": "12.8",
+           "torch": "2.11.0+cu128", "device": "cuda", "precision": "fp16-autocast",
+           "input": "random", "batch_size": 1}
+
+    def test_environment_and_fingerprint_columns_survive_csv_round_trip(self) -> None:
+        from cap6411_atm.benchmark import results_table
+
+        old = {**self.ENV, "variant": "res240", "family": "baseline", "latency_median_ms": 4.0,
+               "macro_dice": 0.8, "dice_checkpoint": "0123456789012345", "dice_data": "00ab",
+               "dice_threshold": 0.5}
+        with tempfile.TemporaryDirectory() as directory:
+            (loaded,) = read_rows(write_rows([old], Path(directory) / "r.csv"))
+        for key in ("cuda_runtime", "nvidia_driver", "dice_checkpoint", "dice_data"):
+            self.assertEqual(loaded[key], old[key], key)
+        fresh = {**self.ENV, "variant": "ada", "family": "adaptive_merge", "latency_median_ms": 3.9}
+        (pair,) = match_latency([loaded, fresh])  # committed CSV row + freshly measured row
+        self.assertEqual(pair["matched_variant"], "res240")
+        self.assertIn("1.03×", results_table([loaded, fresh]))
+
+    def test_plot_requires_identical_latency_conditions(self) -> None:
+        basis = {"dice_checkpoint": "ck", "dice_data": "val", "dice_threshold": 0.5}
+        rows = [
+            {**self.ENV, **basis, "variant": "a", "family": "baseline", "latency_median_ms": 4.0, "macro_dice": 0.8},
+            {**self.ENV, **basis, "precision": "fp32", "variant": "b", "family": "reduced_resolution",
+             "latency_median_ms": 9.0, "macro_dice": 0.7},
+        ]
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValueError):
+            plot_tradeoff(rows, Path(directory) / "p.png")
+
+    def test_feature_resize_is_fp32_under_autocast(self) -> None:
+        from torch.nn import functional as F
+
+        from cap6411_atm.benchmark.resolution import resize_feature_map
+
+        feature = torch.randn(2, 768, 10, 10)
+        expected = F.interpolate(feature, size=(15, 15), mode="bilinear", align_corners=False)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            actual = resize_feature_map(feature, (15, 15))
+        self.assertEqual(actual.dtype, torch.float32)
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)  # bf16 would miss this
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA GPU")
+    def test_quality_defaults_to_gpu_after_run_suite(self) -> None:
+        variants = {"first": _model(), "second": _model()}
+        run_suite(variants, batch_sizes=(1,), device="cuda", warmup=0, iters=1)
+        self.assertEqual(next(variants["first"].parameters()).device.type, "cpu")
+        loader = [{"image": torch.randn(1, 4, 240, 240), "target": torch.zeros(1, 3, 240, 240),
+                   "patient_id": ["p"], "slice_index": torch.tensor([0])}]
+        result = evaluate_quality_many(variants, loader)
+        self.assertEqual(result["first"]["precision"], "fp16-autocast")
+
+    def test_wrapper_parameters_change_the_checkpoint_fingerprint(self) -> None:
+        from cap6411_atm.benchmark import checkpoint_fingerprint
+
+        model = _model()
+
+        class Merger(nn.Module):
+            def __init__(self, base, value):
+                super().__init__()
+                self.base = base
+                self.scorer = nn.Linear(4, 1)
+                with torch.no_grad():
+                    self.scorer.weight.fill_(value)
+
+            def forward(self, images):
+                return self.base(images)
+
+        self.assertEqual(checkpoint_fingerprint(ReducedResolutionSegmenter(model, 160)),
+                         checkpoint_fingerprint(model))
+        a, b = checkpoint_fingerprint(Merger(model, 0.1)), checkpoint_fingerprint(Merger(model, 0.2))
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(a, checkpoint_fingerprint(model))
+
+    def test_unidentified_slices_are_never_comparable(self) -> None:
+        def loader(seed):
+            generator = torch.Generator().manual_seed(seed)
+            return [{"image": torch.randn(2, 4, 240, 240, generator=generator),
+                     "target": torch.zeros(2, 3, 240, 240)}]
+
+        model = _model()
+        first = evaluate_quality_many({"res240": model}, loader(1), device="cpu")
+        second = evaluate_quality_many({"res160": ReducedResolutionSegmenter(model, 160)}, loader(2), device="cpu")
+        self.assertIsNone(first["res240"]["data_fingerprint"])
+        rows = [
+            {**self.ENV, "variant": "res240", "family": "baseline", "latency_median_ms": 4.0},
+            {**self.ENV, "variant": "res160", "family": "unlabeled", "latency_median_ms": 4.0},
+        ]
+        attach_quality(rows, {**first, **second})
+        with self.assertWarns(UserWarning):
+            (pair,) = match_latency(rows)
+        self.assertNotIn("macro_dice_delta", pair)
+
+
 if __name__ == "__main__":
     unittest.main()

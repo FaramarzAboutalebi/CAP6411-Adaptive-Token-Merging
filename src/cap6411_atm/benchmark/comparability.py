@@ -5,7 +5,8 @@ the same driver, CUDA, and PyTorch build, at the same batch size, precision,
 and input kind.  Dice is only comparable between rows evaluated with the same
 trained weights (checkpoint fingerprint), the same validation slices (data
 fingerprint), and the same threshold.  ``match_latency``, ``results_table``,
-and ``plot_tradeoff`` all apply these rules, so rows combined from different
+and ``plot_tradeoff`` all apply these rules (the plot additionally requires a
+single set of latency conditions), so rows combined from different
 CSVs (for example area51 and a Colab GPU) are never silently mixed.
 """
 

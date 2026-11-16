@@ -58,7 +58,12 @@ BASELINE_TOKENS = _CONFIG.feature_grid[0] * _CONFIG.feature_grid[1]  # 225
 
 # Identifier columns that must never be parsed as numbers when reading a CSV.
 _TEXT_COLUMNS = frozenset(
-    {"variant", "family", "setting", "input", "device", "precision", "dice_scope"}
+    {
+        "variant", "family", "setting", "input", "device", "precision", "dice_scope",
+        # Environment and fingerprint columns: versions like "12.8" or "575.51"
+        # and hex digests must compare equal to freshly stamped (string) rows.
+        "gpu", "nvidia_driver", "cuda_runtime", "torch", "dice_checkpoint", "dice_data",
+    }
 )
 
 # Memory already on the GPU (other than the variant and its input) above this
@@ -341,15 +346,16 @@ def evaluate_quality_many(
 
     if not variants:
         raise ValueError("no variants to evaluate")
-    if device is None:
-        device = next(next(iter(variants.values())).parameters()).device
-    device = torch.device(device)
+    # Default to CUDA when available: after run_suite most variants sit on the CPU,
+    # so their current device says nothing about where Dice should run.
+    device = default_device(device)
     for model in variants.values():
         model.to(device).eval()
     metrics = {name: StreamingDice(threshold) for name in variants}
     samples = 0
     patients: set[str] = set()
     slice_keys: list[str] = []
+    slices_identified = True
     truncated = False
     with torch.inference_mode():
         iterator = iter(loader)
@@ -371,7 +377,7 @@ def evaluate_quality_many(
                 for patient, index in zip(batch_patients, slice_indices):
                     slice_keys.append(f"{patient}:{int(index)}")
             else:
-                slice_keys.append(f"batch{batch_count}:{tuple(images.shape)}")
+                slices_identified = False
         # Truncated if the cap was reached and the loader is known to hold more.
         if max_batches is not None and batch_count == max_batches:
             try:
@@ -379,15 +385,18 @@ def evaluate_quality_many(
             except TypeError:
                 truncated = True
     scope = getattr(loader, "scope", "unknown")
-    data_fingerprint = hashlib.sha256(
-        "\n".join(sorted(slice_keys)).encode("utf-8")
-    ).hexdigest()[:16]
+    # Without patient/slice IDs for every sample the evaluated set is unknown;
+    # record no fingerprint so the Dice is never treated as comparable.
+    data_fingerprint = (
+        hashlib.sha256("\n".join(sorted(slice_keys)).encode("utf-8")).hexdigest()[:16]
+        if slices_identified
+        else None
+    )
     fingerprints: dict[int, str] = {}
     results = {}
     for name, metric in metrics.items():
-        base = _trained_model(variants[name])
-        if id(base) not in fingerprints:
-            fingerprints[id(base)] = checkpoint_fingerprint(base)
+        if id(variants[name]) not in fingerprints:
+            fingerprints[id(variants[name])] = checkpoint_fingerprint(variants[name])
         result = metric.compute()
         result.update(
             {
@@ -396,7 +405,7 @@ def evaluate_quality_many(
                 "scope": f"{scope} (truncated at {max_batches} batches)" if truncated else scope,
                 "precision": precision_label(device, amp),
                 "threshold": threshold,
-                "checkpoint_fingerprint": fingerprints[id(base)],
+                "checkpoint_fingerprint": fingerprints[id(variants[name])],
                 "data_fingerprint": data_fingerprint,
             }
         )
@@ -415,19 +424,38 @@ def _trained_model(model: nn.Module) -> nn.Module:
     return model
 
 
-def checkpoint_fingerprint(model: nn.Module) -> str:
-    """Short SHA-256 of every parameter and buffer (names, dtypes, shapes, values).
+def _hash_tensor(digest, key: str, tensor: Tensor) -> None:
+    data = tensor.detach().to("cpu").contiguous()
+    digest.update(f"{key}|{data.dtype}|{tuple(data.shape)}|".encode("utf-8"))
+    digest.update(data.reshape(-1).view(torch.uint8).numpy().tobytes())
 
-    Two variants built on the same trained weights (backbone + adapter +
-    decoder) get the same fingerprint, regardless of resolution wrapper or
-    device; any differing weight changes it.
+
+def checkpoint_fingerprint(model: nn.Module) -> str:
+    """Short SHA-256 of a variant's weights (names, dtypes, shapes, values).
+
+    Hashes the trained segmenter inside the variant (backbone + adapter +
+    decoder, keyed by its own parameter names) plus any parameters or buffers
+    the variant holds outside it, such as a merger's learned scorer.  So the
+    plain baseline and a resolution wrapper around it share a fingerprint, and
+    any differing weight, including a wrapper's own, changes it.
     """
 
+    base = _trained_model(model)
     digest = hashlib.sha256()
-    for key, tensor in sorted(model.state_dict().items()):
-        data = tensor.detach().to("cpu").contiguous()
-        digest.update(f"{key}|{data.dtype}|{tuple(data.shape)}|".encode("utf-8"))
-        digest.update(data.reshape(-1).view(torch.uint8).numpy().tobytes())
+    for key, tensor in sorted(base.state_dict().items()):
+        _hash_tensor(digest, key, tensor)
+    if base is not model:
+        base_ids = {id(t) for t in itertools.chain(base.parameters(), base.buffers())}
+        extra = [
+            (name, tensor)
+            for name, tensor in itertools.chain(
+                model.named_parameters(remove_duplicate=True),
+                model.named_buffers(remove_duplicate=True),
+            )
+            if id(tensor) not in base_ids
+        ]
+        for name, tensor in sorted(extra, key=lambda item: item[0]):
+            _hash_tensor(digest, f"variant.{name}", tensor)
     return digest.hexdigest()[:16]
 
 
@@ -574,9 +602,10 @@ def plot_tradeoff(
     if not selected:
         raise ValueError("no rows with macro_dice; run attach_quality first")
     check_same_dice_basis(selected)
-    gpus = {r.get("gpu") for r in selected}
-    if len(gpus) > 1:
-        raise ValueError(f"rows were measured on different GPUs {sorted(map(str, gpus))}")
+    conditions = {latency_conditions(r) for r in selected}
+    if len(conditions) > 1:
+        detail = "; ".join(str(dict(zip(LATENCY_KEYS, c))) for c in conditions)
+        raise ValueError(f"rows were measured under different conditions: {detail}")
     figure = Figure(figsize=(6, 4))
     axis = figure.subplots()
     families: dict[str, list[Mapping[str, Any]]] = {}

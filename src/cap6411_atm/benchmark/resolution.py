@@ -63,16 +63,26 @@ def bilinear_resize_matrix(
 
 
 def resize_feature_map(feature: Tensor, target: tuple[int, int]) -> Tensor:
-    """Bilinear resize of ``[B,C,H,W]`` to ``[B,C,*target]`` as a single matmul."""
+    """Bilinear resize of ``[B,C,H,W]`` to ``[B,C,*target]`` as a single matmul.
+
+    The matmul always runs in at least fp32 with autocast disabled, matching
+    ``F.interpolate`` (which autocast leaves in the input dtype).  Otherwise
+    fp16 autocast would round reduced-resolution features that the 240px
+    baseline never resizes, biasing the Dice comparison.  The result keeps
+    the input dtype.
+    """
 
     batch, channels, height, width = feature.shape
     if (height, width) == tuple(target):
         return feature
+    compute_dtype = torch.promote_types(feature.dtype, torch.float32)
     matrix = bilinear_resize_matrix(
-        (height, width), target, device=feature.device, dtype=feature.dtype
+        (height, width), target, device=feature.device, dtype=compute_dtype
     )
-    flat = feature.reshape(batch, channels, height * width)
-    return (flat @ matrix.T).reshape(batch, channels, *target)
+    flat = feature.reshape(batch, channels, height * width).to(compute_dtype)
+    with torch.autocast(device_type=feature.device.type, enabled=False):
+        resized = flat @ matrix.T
+    return resized.to(feature.dtype).reshape(batch, channels, *target)
 
 
 class ReducedResolutionSegmenter(nn.Module):
