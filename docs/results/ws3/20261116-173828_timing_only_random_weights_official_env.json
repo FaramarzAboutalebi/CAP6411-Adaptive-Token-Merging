@@ -1,0 +1,51 @@
+{
+  "argv": {
+    "amp": true,
+    "artifact": null,
+    "batch_sizes": [
+      1,
+      8,
+      32,
+      128
+    ],
+    "checkpoint": null,
+    "config": "/home/jordan/CAP6411-Adaptive-Token-Merging/configs/benchmark_resolution_sweep.json",
+    "device": null,
+    "dinov3_repo": "/home/jordan/dinov3",
+    "iters": 200,
+    "out": "/home/jordan/CAP6411-Adaptive-Token-Merging/outputs/benchmarks",
+    "seed": 0,
+    "sizes": [
+      240,
+      224,
+      208,
+      192,
+      176,
+      160,
+      144,
+      128
+    ],
+    "stages": true,
+    "tag": "timing_only_random_weights_official",
+    "warmup": 25
+  },
+  "cpu": "x86_64",
+  "cpu_threads": 24,
+  "cuda_runtime": "12.8",
+  "cudnn": 91900,
+  "cudnn_benchmark": false,
+  "device": "cuda",
+  "git_commit": "eb199d23d70d139bf60682858c124ccf53a3fd02",
+  "git_dirty": false,
+  "gpu_compute_capability": "12.0",
+  "gpu_memory_gb": 31.33,
+  "gpu_name": "NVIDIA GeForce RTX 5090",
+  "hostname": "area51",
+  "nvidia_driver": "595.99.02",
+  "platform": "Linux-7.0.0-43-generic-x86_64-with-glibc2.43",
+  "python": "3.12.14",
+  "tf32_matmul": false,
+  "timestamp_utc": "2026-11-16T22:38:28+00:00",
+  "torch": "2.11.0+cu128",
+  "weights": "random (timing only)"
+}
