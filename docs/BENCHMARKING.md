@@ -41,7 +41,9 @@ never mixed silently.
   different checkpoints or validation slices.
 - **Peak memory:** before each variant is measured, all other variants are moved
   off the GPU and the allocator cache is cleared. Any memory still held by something
-  else is recorded as `other_gpu_memory_mb`, with a warning when it is non-trivial.
+  else is recorded as `other_gpu_memory_mb`, with a warning above 32 MB. About 10 MB is
+  normal: CUDA libraries (cuBLAS) keep a persistent workspace, which an untimed
+  warm-up pass creates before the first measurement so that every row is treated the same.
   `peak_memory_variant_mb` excludes it; `model_memory_mb` is the variant's own weights.
 
 ## Reduced-input-resolution baseline

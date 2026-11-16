@@ -584,21 +584,28 @@ class PeerReviewRegressionTests(unittest.TestCase):
         variants = {"first": _model(), "second": _model()}  # separate weights, ~2 x 11 MB
         rows = run_suite(variants, batch_sizes=(1,), device="cuda", warmup=1, iters=2)
         first, second = rows
+        expected_mb = sum(
+            t.numel() * t.element_size()
+            for t in [*variants["second"].parameters(), *variants["second"].buffers()]
+        ) / 1024**2
         self.assertEqual(next(variants["first"].parameters()).device.type, "cpu")
-        self.assertLess(second["other_gpu_memory_mb"], 1.0)
-        self.assertAlmostEqual(second["model_memory_mb"], first["model_memory_mb"], places=3)
+        self.assertAlmostEqual(second["model_memory_mb"], expected_mb, places=3)
+        self.assertAlmostEqual(first["model_memory_mb"], expected_mb, places=3)
+        # Only CUDA library workspace may remain; the first model (expected_mb) must not.
+        self.assertLess(second["other_gpu_memory_mb"], expected_mb)
         self.assertLess(abs(second["peak_memory_mb"] - first["peak_memory_mb"]), 1.0)
+        self.assertLess(abs(second["other_gpu_memory_mb"] - first["other_gpu_memory_mb"]), 1.0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA GPU")
     def test_unrelated_gpu_memory_is_reported_and_excluded(self) -> None:
         clean = run_suite({"m": _model()}, batch_sizes=(1,), device="cuda", warmup=1, iters=2)[0]
-        stray = torch.empty(64 * 1024**2, dtype=torch.uint8, device="cuda")  # 64 MB
+        stray = torch.empty(64 * 1024**2, dtype=torch.uint8, device="cuda")  # 64 MB > 32 MB threshold
         try:
             with self.assertWarns(UserWarning):
                 row = run_suite({"m": _model()}, batch_sizes=(1,), device="cuda", warmup=1, iters=2)[0]
         finally:
             del stray
-        self.assertAlmostEqual(row["other_gpu_memory_mb"], 64.0, delta=1.0)
+        self.assertAlmostEqual(row["other_gpu_memory_mb"] - clean["other_gpu_memory_mb"], 64.0, delta=1.0)
         self.assertAlmostEqual(row["peak_memory_variant_mb"], clean["peak_memory_variant_mb"], delta=1.0)
 
 

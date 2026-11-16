@@ -63,7 +63,10 @@ _TEXT_COLUMNS = frozenset(
 
 # Memory already on the GPU (other than the variant and its input) above this
 # threshold is reported as a warning: it would inflate peak-memory numbers.
-_OTHER_MEMORY_WARN_MB = 1.0
+# CUDA libraries keep a small persistent workspace (~10 MB for cuBLAS on an
+# RTX 5090), which is created by the warm-up pass in run_suite and is not a
+# leftover model; any real leftover model (ViT-B alone is ~170 MB) is far larger.
+_OTHER_MEMORY_WARN_MB = 32.0
 
 
 def describe(model: nn.Module) -> dict[str, Any]:
@@ -135,6 +138,8 @@ def run_suite(
     """
 
     device = default_device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
     env = collect_env(device)
     stamp = {
         "gpu": env.get("gpu_name", env.get("cpu")),
@@ -143,6 +148,15 @@ def run_suite(
         "torch": env["torch"],
     }
     rows: list[dict[str, Any]] = []
+    if device.type == "cuda" and variants:
+        # One untimed pass so persistent CUDA library workspaces (cuBLAS) exist
+        # before the first measurement; otherwise only the first row's peak
+        # would include creating them.
+        first = next(iter(variants))
+        _isolate_on_device(variants, first, device)
+        with torch.inference_mode(), autocast(device, amp):
+            variants[first](_batch(inputs, min(batch_sizes), device, seed))
+        torch.cuda.synchronize(device)
     for name, model in variants.items():
         _isolate_on_device(variants, name, device)
         for batch_size in batch_sizes:
@@ -180,9 +194,22 @@ def _unique_tensors(module: nn.Module):
             yield tensor
 
 
+def _same_device(tensor_device: torch.device, device: torch.device) -> bool:
+    """Device equality that treats ``cuda`` as the current CUDA device."""
+
+    if tensor_device.type != device.type:
+        return False
+    if device.type != "cuda":
+        return True
+    wanted = device.index if device.index is not None else torch.cuda.current_device()
+    return tensor_device.index == wanted
+
+
 def _module_bytes_on(module: nn.Module, device: torch.device) -> int:
     return sum(
-        t.numel() * t.element_size() for t in _unique_tensors(module) if t.device == device
+        t.numel() * t.element_size()
+        for t in _unique_tensors(module)
+        if _same_device(t.device, device)
     )
 
 
