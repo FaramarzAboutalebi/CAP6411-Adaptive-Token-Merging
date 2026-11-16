@@ -102,7 +102,11 @@ def _split_of(dataset: Any) -> str | None:
 def _git_commit() -> str | None:
     try:
         return subprocess.run(
-            ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).resolve().parent,  # the package's repo, not the caller's cwd
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         return None
