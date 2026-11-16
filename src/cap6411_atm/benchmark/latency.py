@@ -95,7 +95,12 @@ def benchmark(
 
     is_cuda = device.type == "cuda"
     times_ms: list[float] = []
-    with torch.inference_mode(), autocast(device, amp):
+    # Make the requested GPU current for the whole measurement, so the model's
+    # kernels, the timing events, and the synchronization all use the same
+    # device and stream even when it is not the default (e.g. --device cuda:1).
+    device_context = torch.cuda.device(device) if is_cuda else nullcontext()
+    with torch.inference_mode(), autocast(device, amp), device_context:
+        stream = torch.cuda.current_stream(device) if is_cuda else None
         for _ in range(warmup):
             model(inputs)
         synchronize(device)
@@ -106,9 +111,9 @@ def benchmark(
             if is_cuda:
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
-                start.record()
+                start.record(stream)
                 model(inputs)
-                end.record()
+                end.record(stream)
                 end.synchronize()
                 times_ms.append(start.elapsed_time(end))
             else:

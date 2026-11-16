@@ -705,5 +705,64 @@ class ThirdReviewRegressionTests(unittest.TestCase):
         self.assertNotIn("macro_dice_delta", pair)
 
 
+class CodexReviewRegressionTests(unittest.TestCase):
+    """Guard for the Codex review finding on non-current CUDA devices."""
+
+    def test_timing_events_use_the_requested_cuda_device(self) -> None:
+        from unittest import mock
+
+        requested = torch.device("cuda", 1)
+        current: list[torch.device] = []
+        seen_during_model: list[list[torch.device]] = []
+        recorded_on: list[object] = []
+
+        class FakeDeviceContext:
+            def __init__(self, device):
+                self.device = torch.device(device)
+
+            def __enter__(self):
+                current.append(self.device)
+
+            def __exit__(self, *exc):
+                current.pop()
+
+        class FakeEvent:
+            def __init__(self, enable_timing=False):
+                pass
+
+            def record(self, stream=None):
+                recorded_on.append(stream)
+
+            def synchronize(self):
+                pass
+
+            def elapsed_time(self, other):
+                return 1.0
+
+        def current_stream(device=None):
+            return ("stream", torch.device(device) if device is not None else current[-1])
+
+        def model(inputs):
+            seen_during_model.append(list(current))
+
+        with mock.patch.multiple(
+            torch.cuda,
+            device=FakeDeviceContext,
+            Event=FakeEvent,
+            current_stream=current_stream,
+            synchronize=lambda *a, **k: None,
+            reset_peak_memory_stats=lambda *a, **k: None,
+            memory_allocated=lambda *a, **k: 0,
+            max_memory_allocated=lambda *a, **k: 0,
+        ):
+            result = benchmark(model, object(), device=requested, batch_size=1,
+                               warmup=1, iters=3, amp=False)
+
+        self.assertEqual(result["latency_median_ms"], 1.0)
+        self.assertTrue(seen_during_model)
+        self.assertTrue(all(stack == [requested] for stack in seen_during_model))
+        self.assertEqual(recorded_on, [("stream", requested)] * 6)
+
+
 if __name__ == "__main__":
     unittest.main()
