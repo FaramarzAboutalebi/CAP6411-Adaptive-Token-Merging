@@ -380,6 +380,28 @@ class SecondReviewRegressionTests(unittest.TestCase):
             wrapper(torch.randn(1, 4, 240, 240))
 
 
+class FeatureResizeTests(unittest.TestCase):
+    def test_matmul_resize_equals_bilinear_interpolate(self) -> None:
+        from torch.nn import functional as F
+
+        from cap6411_atm.benchmark.resolution import resize_feature_map
+
+        for grid in (8, 10, 12, 14):
+            feature = torch.randn(3, 768, grid, grid)
+            expected = F.interpolate(feature, size=(15, 15), mode="bilinear", align_corners=False)
+            actual = resize_feature_map(feature, (15, 15))
+            self.assertEqual(actual.shape, (3, 768, 15, 15))
+            torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+    def test_identity_grid_is_untouched_and_dtype_kept(self) -> None:
+        from cap6411_atm.benchmark.resolution import resize_feature_map
+
+        feature = torch.randn(1, 4, 15, 15)
+        self.assertIs(resize_feature_map(feature, (15, 15)), feature)
+        half = torch.randn(1, 4, 10, 10, dtype=torch.float64)
+        self.assertEqual(resize_feature_map(half, (15, 15)).dtype, torch.float64)
+
+
 class TableAndConfigTests(unittest.TestCase):
     ROWS = [
         {"variant": "res240", "family": "baseline", "batch_size": 1, "device": "cuda",
