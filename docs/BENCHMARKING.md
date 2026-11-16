@@ -23,6 +23,27 @@ synthetic backbone from `tests/test_dinov3_segmentation.py`, so run them with `d
 
 `tokens_theoretical` is a token count, not a measurement. Never report it as a speedup.
 
+## What makes two results comparable
+
+These rules live in `benchmark/comparability.py`. `match_latency`, `results_table`
+and `plot_tradeoff` all enforce them, so rows combined from different CSVs are
+never mixed silently.
+
+- **Latency:** every row is stamped with `gpu`, `nvidia_driver`, `cuda_runtime` and
+  `torch`. Rows are only matched, and only given a speedup, against rows with the
+  same GPU, driver, CUDA, PyTorch, batch size, device, precision and input kind.
+  The plot refuses rows from different GPUs.
+- **Dice:** each Dice result records `checkpoint_fingerprint` (a SHA-256 of all
+  trained weights, so the backbone, adapter and decoder all count) and `data_fingerprint` (a SHA-256
+  of the exact patient/slice list), plus the threshold. `attach_quality` copies these
+  into the `dice_checkpoint`, `dice_data` and `dice_threshold` columns. A Dice delta is only reported when all
+  three match. The tables and plot raise an error if their Dice values come from
+  different checkpoints or validation slices.
+- **Peak memory:** before each variant is measured, all other variants are moved
+  off the GPU and the allocator cache is cleared. Any memory still held by something
+  else is recorded as `other_gpu_memory_mb`, with a warning when it is non-trivial.
+  `peak_memory_variant_mb` excludes it; `model_memory_mb` is the variant's own weights.
+
 ## Reduced-input-resolution baseline
 
 `ReducedResolutionSegmenter(model, r)` keeps the shared

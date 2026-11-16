@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
+import hashlib
 import itertools
 import json
 import math
@@ -32,6 +34,12 @@ from cap6411_atm.models import BraTSDINOv3Segmenter, DINOv3SegmentationConfig
 from cap6411_atm.project import PROJECT_ROOT
 from cap6411_atm.training.metrics import StreamingDice
 
+from .comparability import (
+    LATENCY_KEYS,
+    check_same_dice_basis,
+    latency_conditions,
+    same_dice_basis,
+)
 from .env import collect_env, default_device, write_env
 from .latency import (
     autocast,
@@ -53,8 +61,9 @@ _TEXT_COLUMNS = frozenset(
     {"variant", "family", "setting", "input", "device", "precision", "dice_scope"}
 )
 
-# Rows are only latency-matched when these columns agree.
-_COMPARABLE_KEYS = ("batch_size", "device", "precision", "input")
+# Memory already on the GPU (other than the variant and its input) above this
+# threshold is reported as a warning: it would inflate peak-memory numbers.
+_OTHER_MEMORY_WARN_MB = 1.0
 
 
 def describe(model: nn.Module) -> dict[str, Any]:
@@ -116,19 +125,42 @@ def run_suite(
     ``inputs`` may hold real MRI slices ``[N,4,240,240]``.  Use real slices for
     content-adaptive variants, whose cost can depend on image content; the
     default is seeded random input, which is fine for fixed-token models.
+
+    Every row is stamped with the GPU model, driver, CUDA, and PyTorch build,
+    so rows from different machines are never treated as comparable.  Before
+    each variant is measured, all *other* variants are moved off the GPU and
+    the allocator cache is cleared.  Memory still held by anything else is
+    recorded as ``other_gpu_memory_mb`` (with a warning when non-trivial), and
+    ``peak_memory_variant_mb`` excludes it.
     """
 
     device = default_device(device)
+    env = collect_env(device)
+    stamp = {
+        "gpu": env.get("gpu_name", env.get("cpu")),
+        "nvidia_driver": env.get("nvidia_driver"),
+        "cuda_runtime": env.get("cuda_runtime"),
+        "torch": env["torch"],
+    }
     rows: list[dict[str, Any]] = []
     for name, model in variants.items():
-        model.to(device).eval()
+        _isolate_on_device(variants, name, device)
         for batch_size in batch_sizes:
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
             images = _batch(inputs, batch_size, device, seed)
-            row: dict[str, Any] = {"variant": name, **describe(model)}
+            row: dict[str, Any] = {"variant": name, **describe(model), **stamp}
             row["input"] = "random" if inputs is None else "mri_slices"
+            other_mb = _other_gpu_memory_mb(model, images)
             row.update(benchmark(model, images, warmup=warmup, iters=iters, amp=amp))
+            if device.type == "cuda":
+                row["model_memory_mb"] = _module_bytes_on(model, device) / 1024**2
+                row["other_gpu_memory_mb"] = other_mb
+                row["peak_memory_variant_mb"] = row["peak_memory_mb"] - other_mb
+                if other_mb > _OTHER_MEMORY_WARN_MB:
+                    warnings.warn(
+                        f"{name}: {other_mb:.1f} MB of unrelated GPU memory was allocated "
+                        "during measurement; peak_memory_mb includes it, "
+                        "peak_memory_variant_mb excludes it"
+                    )
             if stages and supports_stage_timing(model):
                 # Variants without a known stage split get no stage columns,
                 # rather than stage times measured on the wrong code path.
@@ -138,6 +170,49 @@ def run_suite(
                     row[f"{stage}_median_ms"] = result["latency_median_ms"]
             rows.append(row)
     return rows
+
+
+def _unique_tensors(module: nn.Module):
+    seen: set[int] = set()
+    for tensor in itertools.chain(module.parameters(), module.buffers()):
+        if id(tensor) not in seen:
+            seen.add(id(tensor))
+            yield tensor
+
+
+def _module_bytes_on(module: nn.Module, device: torch.device) -> int:
+    return sum(
+        t.numel() * t.element_size() for t in _unique_tensors(module) if t.device == device
+    )
+
+
+def _isolate_on_device(
+    variants: Mapping[str, nn.Module], current: str, device: torch.device
+) -> None:
+    """Move every other variant off the GPU, then put ``current`` on it.
+
+    Variants may share submodules (the resolution sweep shares one base
+    model), so the others are moved to CPU first and ``current`` last.
+    """
+
+    if device.type == "cuda":
+        for name, other in variants.items():
+            if name != current:
+                other.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+    variants[current].to(device).eval()
+
+
+def _other_gpu_memory_mb(model: nn.Module, images: Tensor) -> float:
+    """Allocated GPU memory not belonging to ``model`` or ``images``."""
+
+    device = images.device
+    if device.type != "cuda":
+        return 0.0
+    torch.cuda.synchronize(device)
+    own = _module_bytes_on(model, device) + images.numel() * images.element_size()
+    return max(torch.cuda.memory_allocated(device) - own, 0) / 1024**2
 
 
 def validation_loader(
@@ -247,6 +322,7 @@ def evaluate_quality_many(
     metrics = {name: StreamingDice(threshold) for name in variants}
     samples = 0
     patients: set[str] = set()
+    slice_keys: list[str] = []
     truncated = False
     with torch.inference_mode():
         iterator = iter(loader)
@@ -261,7 +337,14 @@ def evaluate_quality_many(
                     logits = model(images)
                 metrics[name].update(logits, targets)
             samples += int(images.shape[0])
-            patients.update(str(p) for p in batch.get("patient_id", ()))
+            batch_patients = [str(p) for p in batch.get("patient_id", ())]
+            patients.update(batch_patients)
+            slice_indices = batch.get("slice_index")
+            if slice_indices is not None and len(batch_patients) == images.shape[0]:
+                for patient, index in zip(batch_patients, slice_indices):
+                    slice_keys.append(f"{patient}:{int(index)}")
+            else:
+                slice_keys.append(f"batch{batch_count}:{tuple(images.shape)}")
         # Truncated if the cap was reached and the loader is known to hold more.
         if max_batches is not None and batch_count == max_batches:
             try:
@@ -269,8 +352,15 @@ def evaluate_quality_many(
             except TypeError:
                 truncated = True
     scope = getattr(loader, "scope", "unknown")
+    data_fingerprint = hashlib.sha256(
+        "\n".join(sorted(slice_keys)).encode("utf-8")
+    ).hexdigest()[:16]
+    fingerprints: dict[int, str] = {}
     results = {}
     for name, metric in metrics.items():
+        base = _trained_model(variants[name])
+        if id(base) not in fingerprints:
+            fingerprints[id(base)] = checkpoint_fingerprint(base)
         result = metric.compute()
         result.update(
             {
@@ -278,10 +368,40 @@ def evaluate_quality_many(
                 "patients": len(patients),
                 "scope": f"{scope} (truncated at {max_batches} batches)" if truncated else scope,
                 "precision": precision_label(device, amp),
+                "threshold": threshold,
+                "checkpoint_fingerprint": fingerprints[id(base)],
+                "data_fingerprint": data_fingerprint,
             }
         )
         results[name] = result
     return results
+
+
+def _trained_model(model: nn.Module) -> nn.Module:
+    """The trained segmenter inside a variant (the wrapped base for wrappers)."""
+
+    if isinstance(model, BraTSDINOv3Segmenter):
+        return model
+    for module in model.modules():
+        if isinstance(module, BraTSDINOv3Segmenter):
+            return module
+    return model
+
+
+def checkpoint_fingerprint(model: nn.Module) -> str:
+    """Short SHA-256 of every parameter and buffer (names, dtypes, shapes, values).
+
+    Two variants built on the same trained weights (backbone + adapter +
+    decoder) get the same fingerprint, regardless of resolution wrapper or
+    device; any differing weight changes it.
+    """
+
+    digest = hashlib.sha256()
+    for key, tensor in sorted(model.state_dict().items()):
+        data = tensor.detach().to("cpu").contiguous()
+        digest.update(f"{key}|{data.dtype}|{tuple(data.shape)}|".encode("utf-8"))
+        digest.update(data.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()[:16]
 
 
 def attach_quality(
@@ -303,6 +423,9 @@ def attach_quality(
         row["dice_scope"] = result.get("scope", "unknown")
         row["dice_patients"] = result.get("patients")
         row["dice_samples"] = result.get("samples")
+        row["dice_checkpoint"] = result.get("checkpoint_fingerprint")
+        row["dice_data"] = result.get("data_fingerprint")
+        row["dice_threshold"] = result.get("threshold")
     return rows
 
 
@@ -317,8 +440,10 @@ def match_latency(
     The full-resolution baseline is included in the reference pool, so a
     merger slower than every reduced resolution is matched to the baseline.
     A candidate is only matched against references measured under the same
-    conditions (batch size, device, precision, and input kind); candidates
-    with no comparable reference are skipped with a warning.
+    conditions (batch size, device, precision, input kind, GPU model, driver,
+    CUDA, and PyTorch build); candidates with no comparable reference are
+    skipped with a warning.  A Dice delta is only reported when both rows'
+    Dice share the same checkpoint and data fingerprints and threshold.
     """
 
     references = ("baseline", reference_family)
@@ -328,17 +453,14 @@ def match_latency(
     if not pool:
         raise ValueError(f"no {reference_family}/baseline rows at batch size {batch_size}")
 
-    def conditions(row: Mapping[str, Any]) -> tuple:
-        return tuple(row.get(key) for key in _COMPARABLE_KEYS)
-
     pairs = []
     for row in candidates:
         latency = row["latency_median_ms"]
-        comparable = [ref for ref in pool if conditions(ref) == conditions(row)]
+        comparable = [ref for ref in pool if latency_conditions(ref) == latency_conditions(row)]
         if not comparable:
             warnings.warn(
                 f"{row['variant']}: no reference measured under the same conditions "
-                f"{dict(zip(_COMPARABLE_KEYS, conditions(row)))}; not matched"
+                f"{dict(zip(LATENCY_KEYS, latency_conditions(row)))}; not matched"
             )
             continue
         match = min(comparable, key=lambda ref: abs(ref["latency_median_ms"] - latency))
@@ -350,7 +472,12 @@ def match_latency(
             "latency_gap_pct": 100.0 * (latency - match["latency_median_ms"]) / match["latency_median_ms"],
             "batch_size": batch_size,
         }
-        if "macro_dice" in row and "macro_dice" in match:
+        if "macro_dice" in row and "macro_dice" in match and not same_dice_basis(row, match):
+            warnings.warn(
+                f"{row['variant']} vs {match['variant']}: Dice from different or unrecorded "
+                "checkpoints/validation slices/thresholds; Dice delta omitted"
+            )
+        elif "macro_dice" in row and "macro_dice" in match:
             pair["macro_dice"] = row["macro_dice"]
             pair["matched_macro_dice"] = match["macro_dice"]
             pair["macro_dice_delta"] = row["macro_dice"] - match["macro_dice"]
@@ -419,6 +546,10 @@ def plot_tradeoff(
     ]
     if not selected:
         raise ValueError("no rows with macro_dice; run attach_quality first")
+    check_same_dice_basis(selected)
+    gpus = {r.get("gpu") for r in selected}
+    if len(gpus) > 1:
+        raise ValueError(f"rows were measured on different GPUs {sorted(map(str, gpus))}")
     figure = Figure(figsize=(6, 4))
     axis = figure.subplots()
     families: dict[str, list[Mapping[str, Any]]] = {}

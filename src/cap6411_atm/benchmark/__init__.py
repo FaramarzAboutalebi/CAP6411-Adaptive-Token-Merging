@@ -2,6 +2,7 @@
 
 from .compare import (
     attach_quality,
+    checkpoint_fingerprint,
     describe,
     evaluate_quality,
     evaluate_quality_many,
@@ -25,6 +26,7 @@ __all__ = [
     "attach_quality",
     "benchmark",
     "benchmark_stages",
+    "checkpoint_fingerprint",
     "collect_env",
     "describe",
     "evaluate_quality",

@@ -10,6 +10,8 @@ from __future__ import annotations
 import math
 from typing import Any, Mapping, Sequence
 
+from .comparability import check_same_dice_basis, latency_conditions
+
 
 def _fmt(value: Any, digits: int) -> str:
     if value is None or (isinstance(value, float) and math.isnan(value)):
@@ -60,8 +62,11 @@ def results_table(
     """One line per variant at ``batch_size``: tokens, latency, speedup, memory, Dice.
 
     Rows are sorted by measured median latency (slowest first).  ``Speedup`` is
-    baseline median / variant median for rows sharing the baseline's device,
-    precision, and input kind; it is blank when no such baseline row exists.
+    baseline median / variant median for rows measured under the same
+    conditions as a baseline row (see ``comparability.LATENCY_KEYS``: GPU,
+    driver, CUDA, PyTorch, device, precision, input kind); it is blank
+    otherwise.  Raises if Dice values come from different checkpoints or
+    validation slices.
     """
 
     selected = sorted(
@@ -71,17 +76,17 @@ def results_table(
     if not selected:
         raise ValueError(f"no rows at batch size {batch_size}")
     baselines = {
-        (r.get("device"), r.get("precision"), r.get("input")): r["latency_median_ms"]
-        for r in selected
-        if r["family"] == "baseline"
+        latency_conditions(r): r["latency_median_ms"] for r in selected if r["family"] == "baseline"
     }
     has_dice = any(isinstance(r.get("macro_dice"), (int, float)) for r in selected)
+    if has_dice:
+        check_same_dice_basis(selected)
     header = ["Variant", "Family", "Tokens (theor.)", "Median ms", "p90 ms", "Speedup", "Peak MB"]
     if has_dice:
         header += ["WT", "TC", "ET", "Macro Dice"]
     body = []
     for row in selected:
-        base = baselines.get((row.get("device"), row.get("precision"), row.get("input")))
+        base = baselines.get(latency_conditions(row))
         speedup = base / row["latency_median_ms"] if base else None
         line = [
             str(row["variant"]),

@@ -143,11 +143,12 @@ class CompareTests(unittest.TestCase):
                          ("adaptive_merge", "r=0.5", 113))
 
     def test_match_latency_picks_nearest_reference(self) -> None:
+        basis = {"dice_checkpoint": "ck", "dice_data": "val", "dice_threshold": 0.5}
         rows = [
-            {"variant": "res240", "family": "baseline", "batch_size": 1, "latency_median_ms": 10.0, "macro_dice": 0.82},
-            {"variant": "res192", "family": "reduced_resolution", "batch_size": 1, "latency_median_ms": 7.0, "macro_dice": 0.78},
-            {"variant": "res160", "family": "reduced_resolution", "batch_size": 1, "latency_median_ms": 5.0, "macro_dice": 0.74},
-            {"variant": "ada50", "family": "adaptive_merge", "batch_size": 1, "latency_median_ms": 6.6, "macro_dice": 0.80},
+            {"variant": "res240", "family": "baseline", "batch_size": 1, "latency_median_ms": 10.0, "macro_dice": 0.82, **basis},
+            {"variant": "res192", "family": "reduced_resolution", "batch_size": 1, "latency_median_ms": 7.0, "macro_dice": 0.78, **basis},
+            {"variant": "res160", "family": "reduced_resolution", "batch_size": 1, "latency_median_ms": 5.0, "macro_dice": 0.74, **basis},
+            {"variant": "ada50", "family": "adaptive_merge", "batch_size": 1, "latency_median_ms": 6.6, "macro_dice": 0.80, **basis},
             {"variant": "ada50", "family": "adaptive_merge", "batch_size": 2, "latency_median_ms": 9.0},
         ]
         (pair,) = match_latency(rows)
@@ -472,6 +473,133 @@ class TableAndConfigTests(unittest.TestCase):
                 load_benchmark_config(bad)
             with self.assertRaises(SystemExit):
                 parse_args(["--dinov3-repo", "x", "--config", str(Path(directory) / "missing.json")])
+
+
+class PeerReviewRegressionTests(unittest.TestCase):
+    """Guards for the three issues raised in the Codex review of PR #1."""
+
+    BASE = {"batch_size": 1, "device": "cuda", "precision": "fp16-autocast", "input": "random",
+            "nvidia_driver": "595.99.02", "cuda_runtime": "12.8", "torch": "2.11.0+cu128"}
+
+    # Issue 1: results must come from the same GPU/environment.
+    def test_rows_are_stamped_with_environment(self) -> None:
+        rows = run_suite(resolution_sweep(_model(), (240,)), batch_sizes=(1,), device="cpu",
+                         warmup=0, iters=1)
+        for key in ("gpu", "torch", "cuda_runtime", "nvidia_driver"):
+            self.assertIn(key, rows[0])
+        self.assertEqual(rows[0]["torch"], torch.__version__)
+
+    def test_no_matching_or_speedup_across_gpus(self) -> None:
+        from cap6411_atm.benchmark import results_table
+
+        rows = [
+            {**self.BASE, "gpu": "NVIDIA GeForce RTX 5090", "variant": "res240", "family": "baseline", "latency_median_ms": 4.0},
+            {**self.BASE, "gpu": "Tesla T4", "variant": "res160", "family": "reduced_resolution", "latency_median_ms": 9.0},
+            {**self.BASE, "gpu": "Tesla T4", "variant": "ada", "family": "adaptive_merge", "latency_median_ms": 8.0},
+        ]
+        with self.assertWarns(UserWarning):
+            self.assertEqual(match_latency([rows[0], rows[2]]), [])
+        (pair,) = match_latency(rows)
+        self.assertEqual(pair["matched_variant"], "res160")  # the T4 reference, not the 5090 one
+        self.assertIn("| res160 | reduced resolution | – | 9.00 | – | – | – |", results_table(rows))
+
+    def test_plot_refuses_mixed_gpus(self) -> None:
+        basis = {"dice_checkpoint": "ck", "dice_data": "val", "dice_threshold": 0.5}
+        rows = [
+            {**self.BASE, **basis, "gpu": "RTX 5090", "variant": "a", "family": "baseline", "latency_median_ms": 4.0, "macro_dice": 0.8},
+            {**self.BASE, **basis, "gpu": "T4", "variant": "b", "family": "reduced_resolution", "latency_median_ms": 9.0, "macro_dice": 0.7},
+        ]
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValueError):
+            plot_tradeoff(rows, Path(directory) / "p.png")
+
+    # Issue 2: Dice must come from the same checkpoint and validation subset.
+    def _loader(self, patient: str):
+        class Loader:
+            scope = "validation pilot"
+
+            def __iter__(self_inner):
+                generator = torch.Generator().manual_seed(1)
+                for index in range(2):
+                    yield {
+                        "image": torch.randn(2, 4, 240, 240, generator=generator),
+                        "target": (torch.rand(2, 3, 240, 240, generator=generator) > 0.5).float(),
+                        "patient_id": [patient, patient],
+                        "slice_index": torch.tensor([2 * index, 2 * index + 1]),
+                    }
+
+        return Loader()
+
+    def test_dice_results_record_checkpoint_and_data_fingerprints(self) -> None:
+        from cap6411_atm.benchmark import checkpoint_fingerprint
+
+        model = _model()
+        results = evaluate_quality_many(resolution_sweep(model, (240, 160)), self._loader("p1"), device="cpu")
+        self.assertEqual(results["res240"]["checkpoint_fingerprint"], checkpoint_fingerprint(model))
+        self.assertEqual(results["res240"]["checkpoint_fingerprint"], results["res160"]["checkpoint_fingerprint"])
+        self.assertEqual(results["res240"]["data_fingerprint"], results["res160"]["data_fingerprint"])
+        self.assertEqual(results["res240"]["threshold"], 0.5)
+
+        other_patient = evaluate_quality(model, self._loader("p2"), device="cpu")
+        self.assertNotEqual(other_patient["data_fingerprint"], results["res240"]["data_fingerprint"])
+
+        retrained = _model()
+        with torch.no_grad():
+            retrained.decoder.prediction.bias.add_(0.1)
+        self.assertNotEqual(checkpoint_fingerprint(retrained), checkpoint_fingerprint(model))
+
+    def test_dice_from_different_bases_is_never_compared(self) -> None:
+        from cap6411_atm.benchmark import results_table
+
+        model, retrained = _model(), _model()
+        with torch.no_grad():
+            retrained.decoder.prediction.bias.add_(0.1)
+        quality = evaluate_quality_many({"res240": model}, self._loader("p1"), device="cpu")
+        quality.update(evaluate_quality_many(
+            {"ada": ReducedResolutionSegmenter(retrained, 160)}, self._loader("p1"), device="cpu"))
+        rows = [
+            {**self.BASE, "gpu": "g", "variant": "res240", "family": "baseline", "latency_median_ms": 4.0},
+            {**self.BASE, "gpu": "g", "variant": "ada", "family": "adaptive_merge", "latency_median_ms": 4.0},
+        ]
+        attach_quality(rows, quality)
+        with self.assertWarns(UserWarning):
+            (pair,) = match_latency(rows)
+        self.assertNotIn("macro_dice_delta", pair)
+        with self.assertRaises(ValueError):
+            results_table(rows)
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValueError):
+            plot_tradeoff(rows, Path(directory) / "p.png")
+
+        # Same weights and slices: the delta is reported and the CSV round trip keeps the basis.
+        same = evaluate_quality_many({"ada": ReducedResolutionSegmenter(model, 160)}, self._loader("p1"), device="cpu")
+        attach_quality(rows, same)
+        with tempfile.TemporaryDirectory() as directory:
+            loaded = read_rows(write_rows(rows, Path(directory) / "r.csv"))
+        (pair,) = match_latency(loaded)
+        self.assertIn("macro_dice_delta", pair)
+        results_table(loaded)
+
+    # Issue 3: peak memory must not include previously loaded models.
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA GPU")
+    def test_peak_memory_excludes_previously_loaded_models(self) -> None:
+        variants = {"first": _model(), "second": _model()}  # separate weights, ~2 x 11 MB
+        rows = run_suite(variants, batch_sizes=(1,), device="cuda", warmup=1, iters=2)
+        first, second = rows
+        self.assertEqual(next(variants["first"].parameters()).device.type, "cpu")
+        self.assertLess(second["other_gpu_memory_mb"], 1.0)
+        self.assertAlmostEqual(second["model_memory_mb"], first["model_memory_mb"], places=3)
+        self.assertLess(abs(second["peak_memory_mb"] - first["peak_memory_mb"]), 1.0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA GPU")
+    def test_unrelated_gpu_memory_is_reported_and_excluded(self) -> None:
+        clean = run_suite({"m": _model()}, batch_sizes=(1,), device="cuda", warmup=1, iters=2)[0]
+        stray = torch.empty(64 * 1024**2, dtype=torch.uint8, device="cuda")  # 64 MB
+        try:
+            with self.assertWarns(UserWarning):
+                row = run_suite({"m": _model()}, batch_sizes=(1,), device="cuda", warmup=1, iters=2)[0]
+        finally:
+            del stray
+        self.assertAlmostEqual(row["other_gpu_memory_mb"], 64.0, delta=1.0)
+        self.assertAlmostEqual(row["peak_memory_variant_mb"], clean["peak_memory_variant_mb"], delta=1.0)
 
 
 if __name__ == "__main__":
