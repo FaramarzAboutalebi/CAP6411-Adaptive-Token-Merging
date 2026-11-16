@@ -104,6 +104,61 @@ passes plus about 0.5 s per patient per rule for metrics on the CPU.
 `forward_seconds` is not a latency benchmark; use Workstream 3's tools for
 latency.
 
+### Command-line scripts (local GPU)
+
+`scripts/` reproduces the baseline results without the notebook. Private inputs are
+passed as flags or as `CAP6411_*` environment variables (see `scripts/_ws4_paths.py`);
+nothing private is hard-coded.
+
+| Script | Does | Output |
+|---|---|---|
+| `ws4_run_baseline.py --out DIR` | One forward pass over the 187 validation patients, scored under the 5 A1 rules and 4 extra A2 thresholds; checks the Workstream 1 Macro Dice | `DIR/validation187/baseline/per_patient.csv` (patient IDs, private) |
+| `ws4_analyze.py RUN_DIR` | A1, A2 and A7 tables (CSV + LaTeX) and quick-look plots | `RUN_DIR/analysis/` |
+| `ws4_figures.py RUN_DIR [OUT]` | The presentation figures below (seaborn, colorblind-safe, seeded) | `RUN_DIR/figures/` |
+| `ws4_qualitative.py RUN_DIR` | MRI case figure (good / typical / hard) with the token grid | contains MRI: keep private |
+
+On an RTX 4080 the full baseline run takes about 22 minutes, mostly CPU metric time.
+
+## Baseline results (validation, n = 187)
+
+Frozen DINOv3 ViT-B/16 + Workstream 1 epoch-2 adapter/decoder, threshold 0.5.
+The pooled Macro Dice is **0.819172**, which reproduces Workstream 1's 0.819176
+(the difference comes from fp16 autocast).
+
+| Region | Pooled Dice | Patient Dice, mean (95% CI) | HD95, median | Surface Dice @ 2 mm, mean |
+|---|---|---|---|---|
+| WT | 0.869 | 0.843 (0.829–0.856) | 13.0 mm | 0.71 |
+| TC | 0.856 | 0.800 (0.773–0.825) | 5.8 mm | 0.74 |
+| ET | 0.732 | 0.668 (0.640–0.694) | 6.4 mm | 0.68 |
+
+- **Where errors are.** 74% of WT errors (63% TC, 72% ET) lie within 2 mm of
+  the ground-truth surface. In 16×16 token patches that straddle the WT
+  boundary, the error rate is 11.2%; in background patches it is 0.02%
+  (about 480× lower). Boundary patches are only 2.2% of all tokens. Merging
+  background tokens should therefore cost little, while boundary tokens need
+  protecting. This is the reference for A4.
+- **A1, decision rules.** The best rule (nesting, removing components under
+  50 voxels, clearing ET under 200 voxels) moves Macro Dice from 0.8192 to
+  0.8196. It lowers ET HD95 by 2.6 mm (95% CI 0.2–7.0; better for 108
+  patients, worse for 10) and cuts WT false-positive components from 6.1 to
+  3.3 per patient.
+- **A2, threshold.** Macro Dice stays within 0.8184–0.8193 for thresholds 0.3 to
+  0.7. ET is over-segmented at every threshold (1.41× the true volume at 0.3,
+  1.32× at 0.7), so this is a model bias, not a threshold problem. The sweep
+  is a validation-only sensitivity check, not a tuned setting.
+- **A7, size and small lesions.** In the smallest WT-size tertile, ET Dice is
+  0.61 (vs 0.70 medium, 0.69 large). Detection of ET lesions under 100 voxels
+  is 40% (n = 607), vs 87% for 100–1k voxels and 100% above 1k voxels.
+
+![Baseline overview](figures/workstream4/01_baseline_overview.png)
+![Errors by boundary distance](figures/workstream4/02_errors_by_boundary_distance.png)
+![Token-patch errors](figures/workstream4/03_token_patch_errors.png)
+![A1 post-processing](figures/workstream4/04_A1_postprocessing.png)
+![A2 threshold](figures/workstream4/05_A2_threshold.png)
+![A7 tumor size](figures/workstream4/06_A7_tumor_size.png)
+![A7 lesion detection](figures/workstream4/07_A7_lesion_detection.png)
+![Volume agreement](figures/workstream4/08_volume_agreement.png)
+
 ## Interface for Workstreams 2 and 3
 
 `build_model(spec)` must return a module or callable mapping normalized

@@ -51,7 +51,7 @@ Each role includes implementation, testing, experiments, documentation, and cont
 | Dataset & segmentation baseline | Completed |
 | Adaptive token merging | Unassigned |
 | Efficiency & baseline comparisons | Unassigned |
-| Segmentation evaluation & ablations | In progress (`feature/evaluation`) |
+| Segmentation evaluation & ablations | Baseline evaluated; merging ablations wait on Workstream 2 ([`docs/EVALUATION.md`](docs/EVALUATION.md)) |
 
 ### Role 1 — Dataset & Segmentation Baseline
 
