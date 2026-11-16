@@ -380,5 +380,77 @@ class SecondReviewRegressionTests(unittest.TestCase):
             wrapper(torch.randn(1, 4, 240, 240))
 
 
+class TableAndConfigTests(unittest.TestCase):
+    ROWS = [
+        {"variant": "res240", "family": "baseline", "batch_size": 1, "device": "cuda",
+         "precision": "fp16-autocast", "input": "random", "tokens_theoretical": 225,
+         "latency_median_ms": 10.0, "latency_p90_ms": 10.5, "peak_memory_mb": 500.0,
+         "macro_dice": 0.819, "dice_WT": 0.869, "dice_TC": 0.856, "dice_ET": 0.732},
+        {"variant": "res160", "family": "reduced_resolution", "batch_size": 1, "device": "cuda",
+         "precision": "fp16-autocast", "input": "random", "tokens_theoretical": 100,
+         "latency_median_ms": 5.0, "latency_p90_ms": 5.2, "peak_memory_mb": 300.0},
+    ]
+
+    def test_results_table_markdown(self) -> None:
+        from cap6411_atm.benchmark import results_table
+
+        table = results_table(self.ROWS).splitlines()
+        self.assertTrue(table[0].startswith("| Variant |") and "Macro Dice" in table[0])
+        self.assertIn("| res240 | baseline | 225 | 10.00 | 10.50 | 1.00× | 500 | 0.869 | 0.856 | 0.732 | 0.819 |", table)
+        self.assertIn("| res160 | reduced resolution | 100 | 5.00 | 5.20 | 2.00× | 300 | – | – | – | – |", table)
+
+    def test_speedup_only_against_same_conditions(self) -> None:
+        from cap6411_atm.benchmark import results_table
+
+        other = dict(self.ROWS[1], precision="fp32")
+        table = results_table([self.ROWS[0], other])
+        self.assertIn("| res160 | reduced resolution | 100 | 5.00 | 5.20 | – |", table)
+
+    def test_latex_tables_escape_and_render(self) -> None:
+        from cap6411_atm.benchmark import matched_table, results_table
+
+        latex = results_table(self.ROWS, fmt="latex", caption="RTX 5090; fp16_autocast")
+        self.assertIn(r"\begin{tabular}{lrrrrrrrrrr}", latex)
+        self.assertIn(r"reduced resolution", latex)
+        self.assertIn(r"fp16\_autocast", latex)
+        pair = {"variant": "ada_50", "latency_median_ms": 5.1, "matched_variant": "res160",
+                "matched_latency_median_ms": 5.0, "latency_gap_pct": 2.0,
+                "macro_dice": 0.80, "matched_macro_dice": 0.76, "macro_dice_delta": 0.04}
+        self.assertIn(r"ada\_50 & 5.10 & res160 & 5.00 & +2.0 & 0.800 & 0.760 & +0.040 \\",
+                      matched_table([pair], fmt="latex"))
+        with self.assertRaises(ValueError):
+            results_table(self.ROWS, fmt="html")
+
+    def test_repo_config_is_valid_and_drives_cli_defaults(self) -> None:
+        from cap6411_atm.benchmark import load_benchmark_config
+        from cap6411_atm.benchmark.compare import DEFAULT_CONFIG, parse_args
+
+        config = load_benchmark_config(DEFAULT_CONFIG)
+        self.assertEqual(config["sizes"][0], 240)
+        args = parse_args(["--dinov3-repo", "x"])
+        self.assertEqual((args.sizes, args.iters, args.stages, args.amp),
+                         (config["sizes"], config["iters"], config["stages"], config["amp"]))
+        overridden = parse_args(["--dinov3-repo", "x", "--iters", "7", "--no-stages", "--no-amp"])
+        self.assertEqual((overridden.iters, overridden.stages, overridden.amp), (7, False, False))
+
+    def test_bad_config_is_rejected(self) -> None:
+        from cap6411_atm.benchmark import load_benchmark_config
+        from cap6411_atm.benchmark.compare import parse_args
+
+        with tempfile.TemporaryDirectory() as directory:
+            bad = Path(directory) / "bad.json"
+            bad.write_text(json.dumps({"sizes": [240], "iterz": 5}))
+            with self.assertRaises(ValueError):
+                load_benchmark_config(bad)
+            bad.write_text(json.dumps({"sizes": ["240"]}))
+            with self.assertRaises(ValueError):
+                load_benchmark_config(bad)
+            bad.write_text(json.dumps({"warmup": True}))
+            with self.assertRaises(ValueError):
+                load_benchmark_config(bad)
+            with self.assertRaises(SystemExit):
+                parse_args(["--dinov3-repo", "x", "--config", str(Path(directory) / "missing.json")])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -41,6 +41,7 @@ from .latency import (
     supports_stage_timing,
 )
 from .resolution import DEFAULT_RESOLUTIONS, ReducedResolutionSegmenter, resolution_sweep
+from .tables import results_table
 
 
 _CONFIG = DINOv3SegmentationConfig()
@@ -475,9 +476,48 @@ def load_timing_only_dinov3_vitb16(repository: str | Path) -> nn.Module:
     )
 
 
+DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "benchmark_resolution_sweep.json"
+_CONFIG_KEYS = {
+    "sizes": list,
+    "batch_sizes": list,
+    "warmup": int,
+    "iters": int,
+    "amp": bool,
+    "stages": bool,
+    "seed": int,
+}
+
+
+def load_benchmark_config(path: str | Path = DEFAULT_CONFIG) -> dict[str, Any]:
+    """Load and validate a benchmark settings JSON (see ``configs/``)."""
+
+    values = json.loads(Path(path).read_text(encoding="utf-8"))
+    unknown = set(values) - set(_CONFIG_KEYS)
+    if unknown:
+        raise ValueError(f"unknown benchmark config keys: {sorted(unknown)}")
+    for key, kind in _CONFIG_KEYS.items():
+        value = values.get(key)
+        if key in values and (
+            not isinstance(value, kind) or (kind is int and isinstance(value, bool))
+        ):
+            raise ValueError(f"benchmark config {key!r} must be {kind.__name__}")
+    for key in ("sizes", "batch_sizes"):
+        if key in values and not all(
+            isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in values[key]
+        ):
+            raise ValueError(f"benchmark config {key!r} must be positive integers")
+    return values
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Benchmark the DINOv3 BraTS baseline and reduced-resolution variants."
+        description="Benchmark the DINOv3 BraTS baseline and reduced-resolution variants. "
+        "Settings come from --config; explicit options override it."
+    )
+    parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG),
+        help="Benchmark settings JSON (default: configs/benchmark_resolution_sweep.json)",
     )
     parser.add_argument("--dinov3-repo", required=True, help="Official DINOv3 checkout at the pinned revision")
     parser.add_argument("--checkpoint", help="Authorized DINOv3 ViT-B/16 checkpoint; omit for timing-only random weights")
@@ -486,8 +526,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2])
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--iters", type=int, default=200)
-    parser.add_argument("--no-amp", action="store_true", help="Benchmark in fp32 instead of fp16 autocast")
-    parser.add_argument("--stages", action="store_true", help="Also time adapter/encoder/decoder separately")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True,
+                        help="fp16 autocast on CUDA (use --no-amp for fp32)")
+    parser.add_argument("--stages", action=argparse.BooleanOptionalAction, default=False,
+                        help="Also time adapter/encoder/decoder separately")
     parser.add_argument("--device", default=None)
     parser.add_argument(
         "--out",
@@ -498,6 +541,22 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse CLI options, using the --config file for defaults.
+
+    Precedence: explicit command-line option > config file > built-in default.
+    """
+
+    parser = _parser()
+    known, _ = parser.parse_known_args(argv)
+    config_path = Path(known.config)
+    if config_path.is_file():
+        parser.set_defaults(**load_benchmark_config(config_path))
+    elif known.config != str(DEFAULT_CONFIG):
+        raise SystemExit(f"benchmark config not found: {config_path}")
+    return parser.parse_args(argv)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     from cap6411_atm.models import (
         BraTSDINOv3Segmenter,
@@ -505,7 +564,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         load_adapter_decoder_artifact,
     )
 
-    args = _parser().parse_args(argv)
+    args = parse_args(argv)
     if args.artifact and not args.checkpoint:
         raise SystemExit("--artifact needs --checkpoint: trained heads on random backbones are meaningless")
     if args.checkpoint:
@@ -525,21 +584,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         device=device,
         warmup=args.warmup,
         iters=args.iters,
-        amp=not args.no_amp,
+        amp=args.amp,
         stages=args.stages,
+        seed=args.seed,
     )
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     out = Path(args.out)
     csv_path = write_rows(rows, out / f"{stamp}_{args.tag}.csv")
     env = collect_env(device, weights=weights, argv=vars(args))
     write_env(out / f"{stamp}_{args.tag}_env.json", env)
-    print(json.dumps({"csv": str(csv_path), "gpu": env.get("gpu_name", env["device"])}))
-    for row in rows:
-        print(
-            f"{row['variant']:>8}  bs={row['batch_size']}  tokens={row['tokens_theoretical']:>3}  "
-            f"median={row['latency_median_ms']:.3f} ms  p90={row['latency_p90_ms']:.3f} ms  "
-            f"peak={row['peak_memory_mb']:.1f} MB"
-        )
+    caption = f"{weights}; {env.get('gpu_name', env['device'])}; {rows[0]['precision']}"
+    tables = [
+        f"## Batch size {batch_size}\n\n" + results_table(rows, batch_size=batch_size, caption=caption)
+        for batch_size in args.batch_sizes
+    ]
+    table_path = out / f"{stamp}_{args.tag}_table.md"
+    table_path.write_text(f"Weights: {weights}\n\n" + "\n".join(tables), encoding="utf-8")
+    print(json.dumps({"csv": str(csv_path), "table": str(table_path),
+                      "gpu": env.get("gpu_name", env["device"])}))
+    print(tables[0])
     return 0
 
 

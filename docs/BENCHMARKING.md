@@ -51,6 +51,20 @@ The default sweep is 240/224/208/192/176/160/144/128, giving 225 down to 64 toke
   (`run_suite(..., inputs=slices)`), because their cost may depend on content.
 - The isolated test split is never evaluated here.
 
+## Settings and report tables
+
+All sweep settings live in `configs/benchmark_resolution_sweep.json`:
+resolutions, batch sizes, warm-up and timed iterations, fp16, stage timing, and seed.
+The command-line tool and the notebook both read this file, and explicit command-line
+options override it. Each run records the settings it actually used in the env JSON.
+
+`results_table(rows, fmt="markdown"|"latex")` produces one line per variant:
+theoretical tokens, measured median/p90 latency, speedup vs the full-resolution
+baseline under the same conditions, peak memory, and (once attached) WT/TC/ET
+and macro Dice. `matched_table(match_latency(rows))` produces the
+latency-matched merger-vs-reference comparison. The command-line tool also writes
+`<stamp>_<tag>_table.md`.
+
 ## Command line
 
 ```bash
@@ -59,12 +73,14 @@ pip install -e /path/to/dinov3 --no-deps
 pip install ftfy omegaconf regex scikit-learn submitit termcolor torchmetrics   # DINOv3 hub imports
 
 # Latency before gated access is granted (official architecture, random weights):
-python -m cap6411_atm.benchmark.compare --dinov3-repo /path/to/dinov3 --stages
+python -m cap6411_atm.benchmark.compare --dinov3-repo /path/to/dinov3
 
 # With authorized weights and the restricted Workstream 1 artifact:
 python -m cap6411_atm.benchmark.compare --dinov3-repo /path/to/dinov3 \
     --checkpoint /path/to/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth \
-    --artifact /path/to/dinov3_vitb16_brats_epoch2_adapter_decoder.pt --stages
+    --artifact /path/to/dinov3_vitb16_brats_epoch2_adapter_decoder.pt
+
+# Quick check overriding the config: python -m ... --sizes 240 160 --iters 20 --no-stages
 ```
 
 On an RTX 50-series (Blackwell) GPU, install a PyTorch build for CUDA 12.8 or
