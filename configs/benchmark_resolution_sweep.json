@@ -1,6 +1,6 @@
 {
   "sizes": [240, 224, 208, 192, 176, 160, 144, 128],
-  "batch_sizes": [1, 2],
+  "batch_sizes": [1, 8, 32, 128],
   "warmup": 25,
   "iters": 200,
   "amp": true,

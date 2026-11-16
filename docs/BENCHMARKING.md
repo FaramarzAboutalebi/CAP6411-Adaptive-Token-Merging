@@ -41,7 +41,7 @@ The default sweep is 240/224/208/192/176/160/144/128, giving 225 down to 64 toke
 
 - Every compared variant runs on **one GPU** (the team benchmark machine, an RTX 5090).
   Colab runs are smoke tests only.
-- Use fp16 autocast, matching Workstream 1 inference, at batch sizes 1 and 2.
+- Use fp16 autocast, matching Workstream 1 inference, at batch sizes 1, 8, 32 and 128 (team decision, Nov 16).
   Use 25 warm-up and 200 timed iterations.
 - Each run writes `outputs/benchmarks/<stamp>_<tag>.csv` plus `<stamp>_<tag>_env.json`.
   The JSON records GPU, driver, CUDA, torch, git commit, and whether the tree had
