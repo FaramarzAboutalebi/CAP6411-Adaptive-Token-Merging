@@ -5,3 +5,6 @@ numpy
 nibabel
 matplotlib
 tqdm
+scipy
+pandas
+seaborn
