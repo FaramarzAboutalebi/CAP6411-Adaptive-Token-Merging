@@ -35,6 +35,25 @@ def _batch_tensors(batch: Any) -> tuple[Tensor, Tensor]:
     return images, targets
 
 
+def _forward_with_metadata(
+    model: nn.Module, images: Tensor
+) -> tuple[Tensor, dict[str, Any] | None]:
+    forward_with_metadata = getattr(model, "forward_with_metadata", None)
+    if callable(forward_with_metadata):
+        result = forward_with_metadata(images)
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise TypeError("forward_with_metadata must return (logits, metadata)")
+        logits, metadata = result
+        if metadata is not None and not isinstance(metadata, dict):
+            raise TypeError("forward metadata must be a dictionary or None")
+    else:
+        logits = model(images)
+        metadata = None
+    if not isinstance(logits, Tensor):
+        raise TypeError("segmentation model must return a logits tensor")
+    return logits, metadata
+
+
 def evaluate_segmentation(
     model: nn.Module,
     batches: Iterable[Any],
@@ -53,6 +72,7 @@ def evaluate_segmentation(
     was_training = model.training
     batch_count = 0
     sample_count = 0
+    experiment_metadata: dict[str, Any] | None = None
     model.eval()
     try:
         with torch.inference_mode():
@@ -62,9 +82,13 @@ def evaluate_segmentation(
                 targets = targets.to(
                     evaluation_device, non_blocking=evaluation_device.type == "cuda"
                 )
-                logits = model(images)
-                if not isinstance(logits, Tensor):
-                    raise TypeError("segmentation model must return a logits tensor")
+                logits, batch_metadata = _forward_with_metadata(model, images)
+                if batch_count == 0:
+                    experiment_metadata = batch_metadata
+                elif batch_metadata != experiment_metadata:
+                    raise RuntimeError(
+                        "model experiment metadata changed between evaluation batches"
+                    )
                 if logits.shape != targets.shape:
                     raise ValueError(
                         f"logits shape {tuple(logits.shape)} does not match target shape "
@@ -85,6 +109,7 @@ def evaluate_segmentation(
     result["samples"] = sample_count
     result["device"] = str(evaluation_device)
     result["threshold"] = threshold
+    result["experiment_metadata"] = experiment_metadata
     return result
 
 

@@ -23,6 +23,25 @@ def _synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _forward_with_metadata(
+    model: nn.Module, images: Tensor
+) -> tuple[Tensor, dict[str, Any] | None]:
+    forward_with_metadata = getattr(model, "forward_with_metadata", None)
+    if callable(forward_with_metadata):
+        result = forward_with_metadata(images)
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise TypeError("forward_with_metadata must return (logits, metadata)")
+        logits, metadata = result
+        if metadata is not None and not isinstance(metadata, dict):
+            raise TypeError("forward metadata must be a dictionary or None")
+    else:
+        logits = model(images)
+        metadata = None
+    if not isinstance(logits, Tensor):
+        raise TypeError("segmentation model must return a logits tensor")
+    return logits, metadata
+
+
 def benchmark_inference(
     model: nn.Module,
     images: Tensor,
@@ -51,23 +70,20 @@ def benchmark_inference(
     try:
         with torch.inference_mode():
             for _ in range(warmup):
-                logits = model(images)
-                if not isinstance(logits, Tensor):
-                    raise TypeError("segmentation model must return a logits tensor")
+                logits, _ = _forward_with_metadata(model, images)
                 del logits
             _synchronize(device)
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
 
             output_shape: tuple[int, ...] | None = None
+            experiment_metadata: dict[str, Any] | None = None
             for _ in range(iterations):
                 _synchronize(device)
                 started = time.perf_counter()
-                logits = model(images)
+                logits, experiment_metadata = _forward_with_metadata(model, images)
                 _synchronize(device)
                 latencies_ms.append((time.perf_counter() - started) * 1000.0)
-                if not isinstance(logits, Tensor):
-                    raise TypeError("segmentation model must return a logits tensor")
                 expected_shape = (
                     images.shape[0],
                     3,
@@ -101,6 +117,7 @@ def benchmark_inference(
         "peak_cuda_bytes": (
             int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None
         ),
+        "experiment_metadata": experiment_metadata,
     }
 
 

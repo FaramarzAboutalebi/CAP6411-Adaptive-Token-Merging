@@ -458,6 +458,64 @@ class BraTSDINOv3Segmenter(nn.Module):
             )
         return self.encoder.forward_features(self.adapter(images))
 
+    def extract_features_with_merge_state(
+        self, images: Tensor
+    ) -> tuple[tuple[Tensor, ...], TokenMergeState | None]:
+        """Return dense tap maps and this forward's realized merge state."""
+        expected = (self.config.input_channels, *self.config.input_size)
+        if images.ndim != 4 or tuple(images.shape[1:]) != expected:
+            raise ValueError(
+                f"expected images [B,{expected[0]},{expected[1]},{expected[2]}], "
+                f"received {tuple(images.shape)}"
+            )
+        return self.encoder.forward_features_with_merge_state(self.adapter(images))
+
+    def forward_with_metadata(self, images: Tensor) -> tuple[Tensor, dict[str, Any]]:
+        """Run segmentation and return realized token/merge metadata for this pass."""
+        features, state = self.extract_features_with_merge_state(images)
+        logits = self.decode_features(features)
+        original_patch_tokens = self.config.feature_grid[0] * self.config.feature_grid[1]
+        special_tokens = self.encoder.special_token_count
+        achieved_patch_tokens = (
+            state.merged_count if state is not None else original_patch_tokens
+        )
+        retained = state.retention_metrics if state is not None else {
+            "original_token_count": original_patch_tokens,
+            "requested_token_count": original_patch_tokens,
+            "achieved_token_count": original_patch_tokens,
+            "requested_retention_ratio": 1.0,
+            "achieved_retention_ratio": 1.0,
+            "retention_ratio_error": 0.0,
+        }
+        merge_enabled = self.encoder.merge_method is not None
+        merge_after_block = self.encoder.merge_after_block if merge_enabled else None
+        block_token_counts = [
+            (
+                original_patch_tokens + special_tokens
+                if not merge_enabled or block_index <= self.encoder.merge_after_block
+                else achieved_patch_tokens + special_tokens
+            )
+            for block_index in range(self.config.transformer_blocks)
+        ]
+        metadata: dict[str, Any] = {
+            "merge_method": self.encoder.merge_method,
+            "merge_ratio": self.encoder.merge_ratio if merge_enabled else None,
+            "merge_after_block": merge_after_block,
+            "first_merged_block": (
+                merge_after_block + 1 if merge_after_block is not None else None
+            ),
+            "feature_blocks": list(self.config.feature_blocks),
+            "special_token_count": special_tokens,
+            "original_patch_token_count": original_patch_tokens,
+            "requested_patch_token_count": retained["requested_token_count"],
+            "achieved_patch_token_count": achieved_patch_tokens,
+            "original_sequence_token_count": original_patch_tokens + special_tokens,
+            "merged_sequence_token_count": achieved_patch_tokens + special_tokens,
+            "block_token_counts": block_token_counts,
+            "retention_metrics": retained,
+        }
+        return logits, metadata
+
     def decode_features(self, features: Sequence[Tensor]) -> Tensor:
         """Decode the four dense feature maps emitted by the encoder."""
 

@@ -67,7 +67,11 @@ The standalone API now has two methods:
 
 - `method="uniform"` uses fixed spatial blocks. If `merge_size` is omitted,
   `merge_ratio` is a requested retained-token fraction and the closest available
-  rectangular block size is selected.
+  rectangular block size is selected. Fixed rectangular blocks cannot realize
+  every ratio on every grid, so inspect `state.retention_metrics` and compare
+  methods using achieved retained counts/ratios, not only requested ratios.
+  When `merge_size` is provided explicitly, ratio-based requested counts are
+  reported as `None`; the achieved count and ratio remain available.
 - `method="adaptive"` clusters tokens independently per sample by descending
   pairwise cosine similarity, merging the most similar groups until the retained
   count is `round(N * merge_ratio)`. This can group non-adjacent positions.
@@ -78,6 +82,15 @@ feature averages remain differentiable with respect to the input tokens. This is
 a content-adaptive post-encoder prototype, not a tumor-boundary-aware algorithm.
 `merge_coordinates` records original positions and `merged_coordinates` records
 each merged group's mean grid coordinate.
+
+The state reports an observed, serializable retention summary:
+
+```python
+merged, state = merge_tokens(tokens, grid_size=(15, 15), merge_ratio=0.75)
+print(state.retention_metrics)
+# Includes requested_token_count, achieved_token_count,
+# requested_retention_ratio, achieved_retention_ratio, and ratio error.
+```
 
 ## Opt-in inter-block DINOv3 integration
 
@@ -133,6 +146,16 @@ and peak allocated CUDA memory when run on CUDA. The evaluator preserves the
 repository's sigmoid threshold and global voxel-count Dice protocol. For fair
 comparisons, use the same hardware, input batches, precision, warm-up, patient
 split, and threshold for every model variant.
+
+Both helpers include an `experiment_metadata` entry for this model. It records
+the configured merge method and ratio, the zero-based block after which merging
+occurs and the first block receiving merged tokens, protected special-token
+count, requested and achieved patch-token counts, full sequence-token counts,
+and per-block sequence-token counts. Counts come from the merge state produced
+by the measured/evaluated forward pass, so uniform merging reports its achieved
+count rather than implying that the requested ratio was met. Baseline models
+report `None` for merge settings and the unchanged sequence length for every
+block. Models without `forward_with_metadata` report `experiment_metadata: None`.
 
 ## Required tests before baseline integration
 

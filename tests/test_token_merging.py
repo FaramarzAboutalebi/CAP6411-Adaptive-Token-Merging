@@ -22,6 +22,37 @@ class TokenMergingTests(unittest.TestCase):
         self.assertEqual(state.merge_size, 1)
         self.assertTrue(torch.equal(state.original_to_merged, torch.arange(225).unsqueeze(0).expand(2, -1)))
 
+    def test_merge_rejects_integer_token_inputs_for_all_methods(self) -> None:
+        integer_tokens = torch.arange(4).reshape(1, 4, 1)
+        for method in ("uniform", "adaptive"):
+            for merge_ratio in (0.0, 0.5):
+                with self.subTest(method=method, merge_ratio=merge_ratio):
+                    with self.assertRaisesRegex(TypeError, "floating-point"):
+                        merge_tokens(
+                            integer_tokens,
+                            grid_size=(2, 2),
+                            merge_ratio=merge_ratio,
+                            method=method,
+                        )
+
+    def test_merge_rejects_nan_and_infinite_token_values(self) -> None:
+        for invalid_value in (float("nan"), float("inf"), float("-inf")):
+            tokens = torch.tensor([[[1.0], [invalid_value], [3.0], [4.0]]])
+            for method in ("uniform", "adaptive"):
+                for merge_ratio in (0.0, 0.5):
+                    with self.subTest(
+                        invalid_value=invalid_value,
+                        method=method,
+                        merge_ratio=merge_ratio,
+                    ):
+                        with self.assertRaisesRegex(ValueError, "finite"):
+                            merge_tokens(
+                                tokens,
+                                grid_size=(2, 2),
+                                merge_ratio=merge_ratio,
+                                method=method,
+                            )
+
     def test_active_merge_changes_token_budget_and_reconstruction_is_lossy(self) -> None:
         tokens = torch.arange(1 * 225 * 4, dtype=torch.float32).reshape(1, 225, 4)
         merged, state = merge_tokens(tokens, grid_size=(15, 15), merge_ratio=0.5)
@@ -32,6 +63,47 @@ class TokenMergingTests(unittest.TestCase):
         reconstructed = reconstruct_tokens(merged, state)
         self.assertEqual(reconstructed.shape, tokens.shape)
         self.assertFalse(torch.allclose(reconstructed, tokens))
+
+    def test_uniform_retention_metrics_report_requested_and_achieved_counts(self) -> None:
+        tokens = torch.zeros(1, 225, 2)
+        for requested_ratio in (0.25, 0.5, 0.75):
+            with self.subTest(requested_ratio=requested_ratio):
+                merged, state = merge_tokens(
+                    tokens, grid_size=(15, 15), merge_ratio=requested_ratio
+                )
+                report = state.retention_metrics
+                self.assertEqual(report["original_token_count"], 225)
+                self.assertEqual(
+                    report["requested_token_count"],
+                    max(1, round(225 * requested_ratio)),
+                )
+                self.assertEqual(report["achieved_token_count"], merged.shape[1])
+                self.assertAlmostEqual(
+                    report["achieved_retention_ratio"], merged.shape[1] / 225
+                )
+                self.assertAlmostEqual(
+                    report["retention_ratio_error"],
+                    report["achieved_retention_ratio"]
+                    - report["requested_retention_ratio"],
+                )
+        self.assertGreater(
+            abs(state.retention_metrics["retention_ratio_error"]), 0.1
+        )
+
+    def test_explicit_uniform_merge_size_reports_no_ratio_target(self) -> None:
+        _, state = merge_tokens(
+            torch.randn(1, 225, 2),
+            grid_size=(15, 15),
+            merge_size=2,
+            merge_ratio=0.5,
+        )
+        report = state.retention_metrics
+        self.assertIsNone(report["requested_token_count"])
+        self.assertIsNone(report["requested_retention_ratio"])
+        self.assertEqual(report["achieved_token_count"], state.merged_count)
+        self.assertAlmostEqual(
+            report["achieved_retention_ratio"], state.merged_count / 225
+        )
 
     def test_batch_elements_do_not_share_state(self) -> None:
         tokens = torch.arange(2 * 225 * 8, dtype=torch.float32).reshape(2, 225, 8)
@@ -51,6 +123,108 @@ class TokenMergingTests(unittest.TestCase):
         self.assertEqual(state.merge_coordinates.shape, (1, 225, 2))
         self.assertLess(merged.shape[1], tokens.shape[1])
 
+    def test_uniform_merge_runs_on_available_devices_and_preserves_gradients(self) -> None:
+        devices = [torch.device("cpu")]
+        if torch.cuda.is_available():
+            devices.append(torch.device("cuda"))
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is not None and mps_backend.is_available():
+            devices.append(torch.device("mps"))
+
+        for device in devices:
+            with self.subTest(device=str(device)):
+                tokens = torch.arange(
+                    18, device=device, dtype=torch.float32
+                ).reshape(2, 9, 1).requires_grad_()
+                merged, state = merge_tokens(
+                    tokens,
+                    grid_size=(3, 3),
+                    merge_size=2,
+                    merge_ratio=1.0,
+                    method="uniform",
+                )
+                self.assertEqual(merged.device, device)
+                self.assertEqual(state.original_to_merged.device, device)
+                self.assertEqual(state.group_sizes.device, device)
+                self.assertEqual(merged.shape, (2, 4, 1))
+                self.assertTrue(state.merged_coordinates.is_floating_point())
+                self.assertTrue(
+                    torch.equal(
+                        state.merged_coordinates[0],
+                        torch.tensor(
+                            [[0.5, 0.5], [0.5, 2.0], [2.0, 0.5], [2.0, 2.0]],
+                            device=device,
+                        ),
+                    )
+                )
+                self.assertTrue(
+                    torch.allclose(
+                        merged[0, :, 0],
+                        torch.tensor([2.0, 3.5, 6.5, 8.0], device=device),
+                    )
+                )
+                reconstructed = reconstruct_tokens(merged, state)
+                self.assertEqual(reconstructed.device, device)
+                self.assertEqual(reconstructed.shape, tokens.shape)
+                merged.sum().backward()
+                self.assertIsNotNone(tokens.grad)
+                self.assertTrue(torch.isfinite(tokens.grad).all())
+
+    def test_reconstruction_rejects_extra_merged_tokens(self) -> None:
+        merged, state = merge_tokens(
+            torch.randn(1, 9, 3),
+            grid_size=(3, 3),
+            merge_size=2,
+            merge_ratio=1.0,
+        )
+        extra_token = torch.cat((merged, merged[:, :1]), dim=1)
+        with self.assertRaisesRegex(ValueError, "merged token count"):
+            reconstruct_tokens(extra_token, state)
+
+    def test_reconstruction_rejects_out_of_range_assignment(self) -> None:
+        merged, state = merge_tokens(
+            torch.randn(1, 9, 3),
+            grid_size=(3, 3),
+            merge_size=2,
+            merge_ratio=1.0,
+        )
+        state.original_to_merged[0, 0] = state.merged_count
+        with self.assertRaisesRegex(ValueError, "outside"):
+            reconstruct_tokens(merged, state)
+
+    def test_reconstruction_rejects_group_sizes_that_disagree_with_assignments(self) -> None:
+        merged, state = merge_tokens(
+            torch.randn(1, 9, 3),
+            grid_size=(3, 3),
+            merge_size=2,
+            merge_ratio=1.0,
+        )
+        state.group_sizes[0, 0] += 1
+        with self.assertRaisesRegex(ValueError, "group_sizes do not match"):
+            reconstruct_tokens(merged, state)
+
+    def test_reconstruction_rejects_inconsistent_merge_weights(self) -> None:
+        merged, state = merge_tokens(
+            torch.randn(1, 9, 3),
+            grid_size=(3, 3),
+            merge_size=2,
+            merge_ratio=1.0,
+        )
+        state.merge_weights[0, 0] = 0.75
+        with self.assertRaisesRegex(ValueError, "merge_weights do not match"):
+            reconstruct_tokens(merged, state)
+
+    def test_reconstruction_rejects_inconsistent_centroids(self) -> None:
+        merged, state = merge_tokens(
+            torch.randn(1, 9, 3),
+            grid_size=(3, 3),
+            merge_size=2,
+            merge_ratio=1.0,
+        )
+        state.merged_coordinates[0, 0, 0] += 1.0
+        with self.assertRaisesRegex(ValueError, "merged_coordinates do not match"):
+            reconstruct_tokens(merged, state)
+
     def test_adaptive_merger_groups_content_similar_nonadjacent_tokens(self) -> None:
         first = torch.tensor(
             [[[1.0, 0.0], [0.0, 1.0], [1.0, 0.0],
@@ -66,6 +240,13 @@ class TokenMergingTests(unittest.TestCase):
         self.assertNotEqual(int(assignments[0]), int(assignments[1]))
         self.assertTrue(torch.equal(merged[0], torch.tensor([[1.0, 0.0], [0.0, 1.0]])))
         self.assertEqual(state.merged_coordinates.shape, (1, 2, 2))
+        self.assertTrue(state.merged_coordinates.is_floating_point())
+        self.assertTrue(
+            torch.allclose(
+                state.merged_coordinates[0],
+                torch.tensor([[1 / 3, 1.0], [2 / 3, 1.0]]),
+            )
+        )
         self.assertEqual(reconstruct_tokens(merged, state).shape, first.shape)
 
     def test_adaptive_assignments_change_when_token_content_changes(self) -> None:

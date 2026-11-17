@@ -38,6 +38,7 @@ class TokenMergeState:
     merge_size: int = 1
     method: str = "uniform"
     merge_ratio: float = 0.0
+    requested_token_count: int | None = None
 
     @property
     def batch_size(self) -> int:
@@ -46,6 +47,34 @@ class TokenMergeState:
     @property
     def merged_count(self) -> int:
         return int(self.group_sizes.shape[1])
+
+    @property
+    def original_token_count(self) -> int:
+        return self.grid_size[0] * self.grid_size[1]
+
+    @property
+    def achieved_retention_ratio(self) -> float:
+        return self.merged_count / self.original_token_count
+
+    @property
+    def retention_metrics(self) -> dict[str, int | float | None]:
+        """Report requested and actual token counts and retention ratios."""
+        requested_ratio = (
+            self.requested_token_count / self.original_token_count
+            if self.requested_token_count is not None
+            else None
+        )
+        achieved_ratio = self.achieved_retention_ratio
+        return {
+            "original_token_count": self.original_token_count,
+            "requested_token_count": self.requested_token_count,
+            "achieved_token_count": self.merged_count,
+            "requested_retention_ratio": requested_ratio,
+            "achieved_retention_ratio": achieved_ratio,
+            "retention_ratio_error": (
+                achieved_ratio - requested_ratio if requested_ratio is not None else None
+            ),
+        }
 
 
 def _validate_input_tokens(tokens: Tensor, grid_size: tuple[int, int]) -> tuple[int, int, int]:
@@ -56,6 +85,10 @@ def _validate_input_tokens(tokens: Tensor, grid_size: tuple[int, int]) -> tuple[
     batch_size, num_tokens, embedding_dim = tokens.shape
     if batch_size <= 0 or num_tokens <= 0:
         raise ValueError("patch tokens must have non-empty batch and token dimensions")
+    if not tokens.is_floating_point():
+        raise TypeError("patch tokens must use a floating-point dtype")
+    if not torch.isfinite(tokens).all():
+        raise ValueError("patch tokens must contain only finite values")
     expected_tokens = grid_size[0] * grid_size[1]
     if num_tokens != expected_tokens:
         raise ValueError(
@@ -113,7 +146,12 @@ def _resolve_group_shape(
     return best_shape
 
 
-def _build_group_map(grid_size: tuple[int, int], merge_size: int | tuple[int, int]) -> Tensor:
+def _build_group_map(
+    grid_size: tuple[int, int],
+    merge_size: int | tuple[int, int],
+    *,
+    device: torch.device,
+) -> Tensor:
     if isinstance(merge_size, tuple):
         merge_height, merge_width = merge_size
     else:
@@ -121,17 +159,12 @@ def _build_group_map(grid_size: tuple[int, int], merge_size: int | tuple[int, in
     if merge_height < 1 or merge_width < 1:
         raise ValueError(f"merge_size entries must be >= 1, received {merge_size}")
     height, width = grid_size
-    group_indices = torch.empty(height * width, dtype=torch.long)
-    next_group = 0
-    for row_start in range(0, height, merge_height):
-        row_end = min(height, row_start + merge_height)
-        for col_start in range(0, width, merge_width):
-            col_end = min(width, col_start + merge_width)
-            for row in range(row_start, row_end):
-                for col in range(col_start, col_end):
-                    group_indices[row * width + col] = next_group
-            next_group += 1
-    return group_indices
+    row_blocks = torch.arange(height, device=device, dtype=torch.long) // merge_height
+    col_blocks = torch.arange(width, device=device, dtype=torch.long) // merge_width
+    num_col_blocks = math.ceil(width / merge_width)
+    return (
+        row_blocks[:, None] * num_col_blocks + col_blocks[None, :]
+    ).reshape(-1)
 
 
 def _build_coordinate_grid(grid_size: tuple[int, int], device: torch.device) -> Tensor:
@@ -207,34 +240,123 @@ def _validate_merge_state(
 ) -> None:
     if merged_tokens.ndim != 3:
         raise ValueError(f"expected merged tokens [B,M,D], received {tuple(merged_tokens.shape)}")
+    if any(size <= 0 for size in merged_tokens.shape):
+        raise ValueError("merged tokens must have non-empty batch, token, and embedding dimensions")
     if expected_batch_size is not None and merged_tokens.shape[0] != expected_batch_size:
         raise ValueError(
             f"merged batch mismatch: expected {expected_batch_size}, received {merged_tokens.shape[0]}"
         )
+    if state.original_to_merged.ndim != 2:
+        raise ValueError("original_to_merged must have shape [B,N]")
     if merged_tokens.shape[0] != state.batch_size:
         raise ValueError(
             f"merged batch size mismatch: state has batch {state.batch_size}, merged has {merged_tokens.shape[0]}"
         )
+    if merged_tokens.shape[1] != state.merged_count:
+        raise ValueError(
+            f"merged token count {merged_tokens.shape[1]} does not match state count "
+            f"{state.merged_count}"
+        )
+    if state.merged_count <= 0:
+        raise ValueError("merge state must describe at least one merged token")
+    if state.requested_token_count is not None and not (
+        1 <= state.requested_token_count <= state.grid_size[0] * state.grid_size[1]
+    ):
+        raise ValueError("requested_token_count must be within the original token range")
     if state.original_to_merged.dtype not in (torch.int32, torch.int64, torch.long):
         raise TypeError("original_to_merged must be integer-valued")
+    if state.original_to_merged.shape[1] == 0:
+        raise ValueError("merge state must describe at least one original token")
     if state.original_to_merged.min().item() < 0:
         raise ValueError("original_to_merged contains negative merge assignments")
-    if state.group_sizes.shape[0] != state.batch_size:
-        raise ValueError("group_sizes batch dimension does not match the state batch size")
-    if state.group_sizes.shape[1] != state.merged_count:
-        raise ValueError("group_sizes does not match the merged count")
+    if state.original_to_merged.max().item() >= state.merged_count:
+        raise ValueError("original_to_merged contains an assignment outside the merged-token range")
+    if state.group_sizes.ndim != 2 or state.group_sizes.shape != (
+        state.batch_size,
+        state.merged_count,
+    ):
+        raise ValueError("group_sizes must have shape [B,M] matching the merge state")
+    if state.group_sizes.dtype not in (torch.int32, torch.int64, torch.long):
+        raise TypeError("group_sizes must be integer-valued")
     if state.merge_weights.shape != state.original_to_merged.shape:
         raise ValueError("merge_weights must match original_to_merged shape")
-    if state.merge_coordinates is not None and state.merge_coordinates.shape[-1] != 2:
-        raise ValueError("merge_coordinates must carry row/column position pairs")
+    if not state.merge_weights.is_floating_point():
+        raise TypeError("merge_weights must be floating-point")
+    if state.grid_size[0] <= 0 or state.grid_size[1] <= 0:
+        raise ValueError(f"merge state has invalid grid_size {state.grid_size}")
+    if state.grid_size[0] * state.grid_size[1] != state.original_to_merged.shape[1]:
+        raise ValueError("original_to_merged length does not match grid_size")
+    if state.original_positions.shape != state.original_to_merged.shape:
+        raise ValueError("original_positions must match original_to_merged shape")
+    if state.original_positions.dtype not in (torch.int32, torch.int64, torch.long):
+        raise TypeError("original_positions must be integer-valued")
+    state_tensors = (
+        state.original_to_merged,
+        state.merge_weights,
+        state.group_sizes,
+        state.original_positions,
+        state.merge_coordinates,
+        state.merged_coordinates,
+    )
+    state_devices = {tensor.device for tensor in state_tensors if tensor is not None}
+    if len(state_devices) != 1:
+        raise ValueError("all tensors in merge state must reside on the same device")
+    if state.merge_coordinates is not None and state.merge_coordinates.shape != (
+        state.batch_size,
+        state.original_to_merged.shape[1],
+        2,
+    ):
+        raise ValueError("merge_coordinates must have shape [B,N,2]")
     if state.merged_coordinates is not None and state.merged_coordinates.shape != (
         state.batch_size,
         state.merged_count,
         2,
     ):
         raise ValueError("merged_coordinates must have shape [B,M,2]")
-    if state.grid_size[0] * state.grid_size[1] != state.original_to_merged.shape[1]:
-        raise ValueError("original_to_merged length does not match grid_size")
+    if state.merged_coordinates is not None and not state.merged_coordinates.is_floating_point():
+        raise TypeError("merged_coordinates must preserve fractional spatial positions")
+
+    device = state.original_to_merged.device
+    expected_positions = torch.arange(
+        state.original_to_merged.shape[1], device=device, dtype=torch.long
+    ).expand(state.batch_size, -1)
+    if not torch.equal(state.original_positions.long(), expected_positions):
+        raise ValueError("original_positions must preserve row-major token order")
+
+    group_ids = torch.arange(state.merged_count, device=device).view(1, -1, 1)
+    assignments = state.original_to_merged.unsqueeze(1)
+    membership = group_ids == assignments
+    actual_group_sizes = membership.sum(dim=-1)
+    if torch.any(actual_group_sizes == 0):
+        raise ValueError("every merged token must have at least one original assignment")
+    if not torch.equal(actual_group_sizes.to(state.group_sizes.dtype), state.group_sizes):
+        raise ValueError("group_sizes do not match original_to_merged assignments")
+
+    expected_weights = actual_group_sizes.gather(
+        1, state.original_to_merged.long()
+    ).to(state.merge_weights.dtype).reciprocal()
+    if not torch.isfinite(state.merge_weights).all() or not torch.allclose(
+        state.merge_weights, expected_weights, rtol=1e-5, atol=1e-7
+    ):
+        raise ValueError("merge_weights do not match original_to_merged assignments")
+
+    if state.merge_coordinates is not None:
+        grid_coordinates = _build_coordinate_grid(state.grid_size, device)
+        expected_coordinates = grid_coordinates.unsqueeze(0).expand(state.batch_size, -1, -1)
+        if not torch.equal(state.merge_coordinates.long(), expected_coordinates):
+            raise ValueError("merge_coordinates do not match the original row-major grid")
+        if state.merged_coordinates is not None:
+            expected_centroids = (
+                membership.to(torch.float32)
+                @ grid_coordinates.to(torch.float32).unsqueeze(0).expand(state.batch_size, -1, -1)
+            ) / actual_group_sizes.to(torch.float32).unsqueeze(-1)
+            if not torch.allclose(
+                state.merged_coordinates.to(torch.float32),
+                expected_centroids,
+                rtol=1e-5,
+                atol=1e-6,
+            ):
+                raise ValueError("merged_coordinates do not match merge assignments")
 
 
 def merge_tokens(
@@ -283,10 +405,11 @@ def merge_tokens(
             group_sizes=group_sizes,
             original_positions=positions,
             merge_coordinates=coordinates,
-            merged_coordinates=coordinates,
+            merged_coordinates=coordinates.to(dtype=torch.float32),
             merge_size=1,
             method=method,
             merge_ratio=float(merge_ratio),
+            requested_token_count=num_tokens,
         )
         return tokens.clone(), state
 
@@ -300,8 +423,13 @@ def merge_tokens(
         )
         if merge_ratio == 0.0 and merge_size is None:
             effective_merge_size = (1, 1)
-        group_map = _build_group_map(grid_size, effective_merge_size)
-        num_groups = int(group_map.max().item()) + 1
+        group_map = _build_group_map(
+            grid_size, effective_merge_size, device=tokens.device
+        )
+        num_groups = (
+            math.ceil(grid_size[0] / effective_merge_size[0])
+            * math.ceil(grid_size[1] / effective_merge_size[1])
+        )
         group_maps = group_map.unsqueeze(0).expand(batch_size, -1)
 
     merged = torch.empty(batch_size, num_groups, embedding_dim, device=tokens.device, dtype=tokens.dtype)
@@ -311,25 +439,25 @@ def merge_tokens(
     original_positions = torch.arange(num_tokens, device=tokens.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
     coordinates = _build_coordinate_grid(grid_size, tokens.device).unsqueeze(0).expand(batch_size, -1, -1)
     merged_coordinates = torch.empty(
-        batch_size, num_groups, 2, device=tokens.device, dtype=coordinates.dtype
+        batch_size, num_groups, 2, device=tokens.device, dtype=torch.float32
     )
 
     for batch_index in range(batch_size):
         batch_tokens = tokens[batch_index]
         batch_map = group_maps[batch_index]
-        batch_sizes = torch.bincount(batch_map, minlength=num_groups)
+        membership = (
+            torch.arange(num_groups, device=tokens.device).unsqueeze(1)
+            == batch_map.unsqueeze(0)
+        )
+        batch_sizes = membership.sum(dim=1)
         if torch.any(batch_sizes == 0):
             raise RuntimeError("merging produced an empty token group")
-        sums = torch.zeros(
-            num_groups, embedding_dim, device=tokens.device, dtype=tokens.dtype
-        ).index_add(0, batch_map, batch_tokens)
-        merged[batch_index] = sums / batch_sizes.to(tokens.dtype).unsqueeze(1)
-        coordinate_sums = torch.zeros(
-            num_groups, 2, device=tokens.device, dtype=coordinates.dtype
-        ).index_add(0, batch_map, coordinates[batch_index])
-        merged_coordinates[batch_index] = coordinate_sums / batch_sizes.to(
-            coordinates.dtype
-        ).unsqueeze(1)
+        merged[batch_index] = (
+            membership.to(tokens.dtype) @ batch_tokens
+        ) / batch_sizes.to(tokens.dtype).unsqueeze(1)
+        merged_coordinates[batch_index] = (
+            membership.to(merged_coordinates.dtype) @ coordinates[batch_index].to(torch.float32)
+        ) / batch_sizes.to(merged_coordinates.dtype).unsqueeze(1)
         original_to_merged[batch_index] = batch_map
         group_sizes[batch_index] = batch_sizes
         per_group_sizes = group_sizes[batch_index, batch_map]
@@ -346,6 +474,11 @@ def merge_tokens(
         merge_size=effective_merge_size[0] * effective_merge_size[1],
         method=method,
         merge_ratio=float(merge_ratio),
+        requested_token_count=(
+            None
+            if merge_size is not None
+            else max(1, min(num_tokens, int(round(num_tokens * merge_ratio))))
+        ),
     )
 
     _validate_merge_state(merged, state, expected_batch_size=batch_size)
@@ -368,6 +501,7 @@ def reconstruct_tokens(merged_tokens: Tensor, state: TokenMergeState) -> Tensor:
             merge_size=state.merge_size,
             method=state.method,
             merge_ratio=state.merge_ratio,
+            requested_token_count=state.requested_token_count,
         )
     index = state.original_to_merged.unsqueeze(-1).expand(-1, -1, merged_tokens.shape[-1])
     reconstructed = merged_tokens.gather(1, index)
