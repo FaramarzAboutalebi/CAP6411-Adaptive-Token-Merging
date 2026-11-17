@@ -48,7 +48,48 @@ def load_results(paths: Iterable[str | Path]) -> pd.DataFrame:
         frames.append(pd.read_csv(path))
     if not frames:
         raise ValueError("no result files given")
-    return add_derived_columns(pd.concat(frames, ignore_index=True))
+    frame = add_derived_columns(pd.concat(frames, ignore_index=True))
+    check_unique_rows(frame)
+    return frame
+
+
+ROW_KEY = ("method", "region", "patient_id")
+
+
+def check_unique_rows(frame: pd.DataFrame) -> None:
+    """Reject repeated (method, region, patient) rows, e.g. a variant loaded twice."""
+
+    duplicated = frame.duplicated(list(ROW_KEY), keep=False)
+    if duplicated.any():
+        examples = frame.loc[duplicated, list(ROW_KEY)].drop_duplicates().head(5).to_dict("records")
+        raise ValueError(f"duplicate per-patient rows ({int(duplicated.sum())} rows), e.g. {examples}")
+
+
+def paired_table(frame: pd.DataFrame, region: str, metric: str, methods: Sequence[str]) -> pd.DataFrame:
+    """Patient x method table for paired tests; methods must cover identical patients.
+
+    Raises if any (method, region, patient) row is duplicated or if a method
+    was evaluated on a different patient set than the others. A metric that is
+    undefined (NaN) for a patient stays NaN; callers drop such pairs.
+    """
+
+    subset = frame[(frame["region"] == region) & frame["method"].isin(methods)]
+    check_unique_rows(subset)
+    missing = [m for m in methods if m not in set(subset["method"])]
+    if missing:
+        raise ValueError(f"methods without {region} rows: {missing}")
+    populations = {m: frozenset(g["patient_id"]) for m, g in subset.groupby("method")}
+    reference = populations[methods[0]]
+    for method in methods[1:]:
+        if populations[method] != reference:
+            only_method = sorted(populations[method] - reference)[:5]
+            only_reference = sorted(reference - populations[method])[:5]
+            raise ValueError(
+                f"{method!r} and {methods[0]!r} cover different patients for {region} "
+                f"(only in {method!r}: {only_method}, only in {methods[0]!r}: {only_reference}); "
+                "paired comparisons need identical patient populations"
+            )
+    return subset.pivot(index="patient_id", columns="method", values=metric)[list(methods)]
 
 
 def add_derived_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -163,16 +204,17 @@ def paired_comparison(
     if reference not in set(frame["method"]):
         raise ValueError(f"reference method {reference!r} not in results")
     methods = [m for m in (methods or frame["method"].unique()) if m != reference]
+    unknown = sorted(set(methods) - set(frame["method"]))
+    if unknown:
+        raise ValueError(f"methods not in results: {unknown}")
     records = []
     for metric in metrics:
         higher = HIGHER_IS_BETTER.get(metric, True)
         for region in regions:
-            subset = frame[frame["region"] == region]
-            pivot = subset.pivot_table(index="patient_id", columns="method", values=metric, aggfunc="first")
+            pivot = paired_table(frame, region, metric, [reference, *methods])
             family = []
             for method in methods:
-                if method not in pivot:
-                    continue
+                # Same patients by construction; only pairs with an undefined metric drop out.
                 pair = pivot[[reference, method]].dropna()
                 diff = (pair[method] - pair[reference]).to_numpy(dtype=float)
                 improvement = diff if higher else -diff
@@ -248,8 +290,7 @@ def failure_cases(
 
     higher = HIGHER_IS_BETTER.get(metric, True)
     subset = frame[frame["region"] == region]
-    pivot = subset.pivot_table(index="patient_id", columns="method", values=metric, aggfunc="first")
-    pivot = pivot[[reference, method]].dropna()
+    pivot = paired_table(frame, region, metric, [reference, method]).dropna()
     pivot["delta"] = pivot[method] - pivot[reference]
     gt = subset.drop_duplicates("patient_id").set_index("patient_id")["gt_volume"]
     pivot["gt_volume"] = gt.reindex(pivot.index)

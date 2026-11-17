@@ -28,6 +28,7 @@ from torch import Tensor
 
 from .metrics import REGION_NAMES, MetricConfig, patient_metrics
 from .postprocess import DEFAULT_RULES, build_postprocessor
+from .provenance import digest, fingerprint_file
 
 
 LogitsFn = Callable[[Tensor], Tensor]
@@ -90,13 +91,60 @@ def evaluate(
     return output
 
 
-def _split_of(dataset: Any) -> str | None:
+KNOWN_SPLITS = ("train", "validation", "test")
+
+
+def _dataset_attribute(dataset: Any, name: str) -> Any:
+    """First ``name`` found walking ``dataset`` -> ``dataset.dataset`` -> ..."""
+
+    while dataset is not None:
+        value = getattr(dataset, name, None)
+        if value is not None:
+            return value
+        dataset = getattr(dataset, "dataset", None)
+    return None
+
+
+def _split_values(dataset: Any) -> list[str]:
+    values = []
     while dataset is not None:
         split = getattr(dataset, "split", None)
         if split is not None:
-            return split
+            values.append(split)
         dataset = getattr(dataset, "dataset", None)
-    return None
+    return values
+
+
+def resolve_split(dataset: Any, declared: str | None = None) -> str:
+    """The single split a dataset (or wrapper chain) belongs to.
+
+    Every ``split`` attribute along the wrapper chain, and ``declared`` when
+    given, must agree; a missing or unknown split is an error.
+    """
+
+    values = _split_values(dataset)
+    if declared is not None:
+        values.append(declared)
+    if not values:
+        raise ValueError(
+            "cannot determine the evaluated split: the dataset has no 'split' attribute; "
+            "pass split=... explicitly"
+        )
+    if len(set(values)) != 1:
+        raise ValueError(f"conflicting split information: {sorted(set(values))}")
+    split = values[0]
+    if split not in KNOWN_SPLITS:
+        raise ValueError(f"unknown split {split!r}; expected one of {KNOWN_SPLITS}")
+    return split
+
+
+def dataset_patient_ids(dataset: Any) -> tuple[str, ...] | None:
+    """Patient IDs a dataset will yield (``patient_ids`` attribute, else ``samples``)."""
+
+    patient_ids = getattr(dataset, "patient_ids", None)
+    if patient_ids is None and getattr(dataset, "samples", None) is not None:
+        patient_ids = dict.fromkeys(patient for patient, _ in dataset.samples)
+    return tuple(patient_ids) if patient_ids is not None else None
 
 
 def _git_commit() -> str | None:
@@ -151,6 +199,10 @@ def evaluate_model(
     variant_info: Mapping[str, Any] | None = None,
     save_patients: Sequence[str] = (),
     allow_test: bool = False,
+    split: str | None = None,
+    expected_depth: int | None = None,
+    allow_partial_volumes: bool = False,
+    provenance: Mapping[str, Any] | None = None,
     progress: bool = False,
 ) -> EvaluationResult:
     """Evaluate ``model`` on every patient produced by ``loader``.
@@ -166,15 +218,34 @@ def evaluate_model(
         save_patients: patient IDs whose image/target/masks are kept in memory
             for figures.
         allow_test: must be ``True`` to evaluate the isolated test split.
+        split: expected split. Required when the loader's dataset does not
+            declare one; must agree with it (and with every batch) otherwise.
+        expected_depth: axial slices per patient volume. Defaults to the
+            dataset's ``axial_depth`` (155 for BraTS). Every patient must
+            contribute exactly slices ``0 .. expected_depth - 1``.
+        allow_partial_volumes: skip the completeness check (debugging only;
+            surface and volume metrics are wrong on partial volumes).
+        provenance: checkpoint / dataset / manifest fingerprints
+            (:func:`~cap6411_atm.evaluation.provenance.build_provenance`),
+            stored in the metadata.
     """
 
     dataset = getattr(loader, "dataset", None)
-    split = _split_of(dataset)
+    split = resolve_split(dataset, split)
     if split == "test" and not allow_test:
         raise PermissionError(
             "refusing to evaluate the isolated test split; pass allow_test=True only "
             "for the final, pre-registered evaluation"
         )
+    if expected_depth is None:
+        expected_depth = _dataset_attribute(dataset, "axial_depth")
+    if expected_depth is None and not allow_partial_volumes:
+        raise ValueError(
+            "cannot determine the patient volume depth; pass expected_depth=... "
+            "(155 for BraTS) or allow_partial_volumes=True"
+        )
+    expected_slices = list(range(int(expected_depth))) if expected_depth is not None else None
+    expected_patients = dataset_patient_ids(dataset) if dataset is not None else None
     rules = dict(rules or DEFAULT_RULES)
     processors = {name: build_postprocessor(spec) for name, spec in rules.items()}
     save_set = set(save_patients)
@@ -200,6 +271,13 @@ def evaluate_model(
             return
         metric_start = time.perf_counter()
         slices, probabilities, targets, images = buffer.volumes()
+        if not allow_partial_volumes and slices != expected_slices:
+            missing = sorted(set(expected_slices) - set(slices))
+            extra = sorted(set(slices) - set(expected_slices))
+            raise RuntimeError(
+                f"incomplete volume for patient {buffer.patient_id}: got {len(slices)} of "
+                f"{len(expected_slices)} slices (missing {missing[:10]}, unexpected {extra[:10]})"
+            )
         target_masks = targets >= 0.5
         keep = buffer.patient_id in save_set
         if keep:
@@ -230,6 +308,11 @@ def evaluate_model(
 
     with torch.inference_mode():
         for batch in loader:
+            if "split" not in batch:
+                raise ValueError("batch has no 'split' field; cannot verify the evaluated split")
+            batch_splits = set(batch["split"])
+            if batch_splits != {split}:
+                raise ValueError(f"batch split {sorted(batch_splits)} conflicts with evaluated split {split!r}")
             images = batch["image"]
             patient_ids = list(batch["patient_id"])
             slice_indices = [int(value) for value in batch["slice_index"]]
@@ -266,12 +349,21 @@ def evaluate_model(
 
     if not finished:
         raise ValueError("loader produced no samples")
+    if expected_patients is not None and set(expected_patients) != finished:
+        missing = sorted(set(expected_patients) - finished)
+        extra = sorted(finished - set(expected_patients))
+        raise RuntimeError(f"evaluated patients differ from the dataset: missing {missing[:10]}, unexpected {extra[:10]}")
+    patient_list = sorted(finished)
     result.metadata = {
         "variant": variant,
         "variant_info": dict(variant_info or {}),
         "rules": rules,
         "split": split,
         "patients": len(finished),
+        "patient_ids_sha256": digest(patient_list),
+        "expected_depth": expected_depth,
+        "complete_volumes": not allow_partial_volumes,
+        "provenance": dict(provenance or {}),
         "slices": slice_count,
         "metric_config": asdict(metric_config),
         "amp": use_amp,
@@ -309,8 +401,10 @@ def save_evaluation(result: EvaluationResult, output_dir: str | Path) -> Path:
         for row in result.rows:
             writer.writerow({key: _clean(value) for key, value in row.items()})
     temporary.replace(output / "per_patient.csv")
+    # The CSV hash lets a resumed run detect a CSV that no longer matches its summary.
+    metadata = {**result.metadata, "per_patient_sha256": fingerprint_file(output / "per_patient.csv")["sha256"]}
     summary = output / "summary.json.tmp"
-    summary.write_text(json.dumps(result.metadata, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+    summary.write_text(json.dumps(metadata, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
     summary.replace(output / "summary.json")
     return output
 

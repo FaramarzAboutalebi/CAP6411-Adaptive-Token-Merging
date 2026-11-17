@@ -14,9 +14,12 @@ number (validation Macro Dice 0.8192) can be reproduced.
 | `evaluator.py` | `evaluate_model` (one forward pass, many rules), `save_evaluation`, `build_eval_loader`, batch-level `evaluate` |
 | `statistics.py` | Summaries, bootstrap CIs, paired Wilcoxon + Holm comparisons, strata, failure cases, report tables |
 | `ablation.py` | `VariantSpec`, `merge_ratio_grid`, resumable `run_ablation`, `collect_results` |
+| `provenance.py` | `build_provenance`, `fingerprint_file`: checkpoint / dataset / manifest fingerprints and the `run_key` that guards resumed results |
 | `visualization.py` | Case overlays and error maps, token merge maps, metric-vs-ratio/latency plots, profiles |
 
-The end-to-end Colab workflow is `notebooks/04_evaluation.ipynb`.
+The end-to-end Colab workflow is `notebooks/04_evaluation.ipynb`. For a
+step-by-step guide to running A1, A2 and A7 (and what A3–A6 need), see
+[`WORKSTREAM4_RUNBOOK.md`](WORKSTREAM4_RUNBOOK.md).
 
 ## Metrics
 
@@ -82,14 +85,19 @@ A1 and A2 cost no extra GPU time: `evaluate_model` applies every rule to the sam
 
 ```python
 from cap6411_atm.evaluation import (
-    VariantSpec, build_eval_loader, run_ablation, summarize, paired_comparison,
+    VariantSpec, build_eval_loader, build_provenance, run_ablation, summarize, paired_comparison,
     POSTPROCESSING_ABLATION,
 )
 
 loader = build_eval_loader(archive, manifest, "configs/brats2023_gli_inspection.json",
                            split="validation", batch_size=16)
+provenance = build_provenance(
+    checkpoint={"dinov3": dinov3_checkpoint, "adapter_decoder": artifact},
+    dataset=archive, manifest=manifest, inspection_config="configs/brats2023_gli_inspection.json",
+)
 variants = [VariantSpec("baseline", rules=POSTPROCESSING_ABLATION)]
-frame = run_ablation(variants, lambda spec: model, loader, "/drive/.../results/ws4", device="cuda")
+frame = run_ablation(variants, lambda spec: model, loader, "/drive/.../results/ws4",
+                     provenance=provenance, device="cuda")
 summary = summarize(frame)
 comparison = paired_comparison(frame, reference="baseline")
 ```
@@ -172,10 +180,35 @@ takes the per-sample, row-major `[225]` original-to-merged assignment from
 
 ## Guardrails
 
-- `evaluate_model` refuses the `test` split unless `allow_test=True` is
-  passed, and `build_eval_loader` never builds it. Run the test split once, at
-  the end, with the protocol fixed.
-- The evaluator requires each patient's slices to be contiguous (a
-  non-shuffled `PatientLocalBatchSampler`). It raises an error otherwise.
+- **Test split.** `evaluate_model` refuses the `test` split unless
+  `allow_test=True` is passed, and `build_eval_loader` never builds it. The
+  split must be known and consistent: it is read from the dataset (and every
+  wrapper around it), optionally declared with `split=...`, and checked
+  against the `split` field of every batch. A missing, unknown or conflicting
+  split is an error. Run the test split once, at the end, with the protocol
+  fixed.
+- **Complete volumes.** Each patient's slices must be contiguous (a
+  non-shuffled `PatientLocalBatchSampler`) and must be exactly slices
+  `0 … 154` (`expected_depth`, read from the dataset's `axial_depth`). Every
+  patient the dataset lists must be evaluated. Partial volumes are refused
+  unless `allow_partial_volumes=True` is passed for debugging, because
+  surface and volume metrics are wrong on them.
+- **Provenance and stale results.** `run_ablation` requires `provenance`
+  (`build_provenance` fingerprints the checkpoint, dataset archive, split
+  manifest and inspection config; the 13 GB archive is hashed from its size,
+  first and last 64 MiB). The provenance, variant spec, rules, metric
+  settings, split, patient list and volume depth form a `run_key` stored in
+  `summary.json` together with the CSV's SHA-256. A finished variant is
+  reused only if both still match; otherwise `run_ablation` raises instead of
+  mixing stale numbers (pass `overwrite=True` or a new output directory).
+- **No mixing experiments.** `collect_results` refuses variants that differ in
+  split, patients, volume depth, metric settings, dataset, manifest or
+  inspection config (`strict=False` loads legacy results without these
+  checks). Checkpoints may differ per variant.
+- **Paired statistics.** `paired_comparison` and `failure_cases` require every
+  method to cover exactly the same patients and reject duplicate
+  (method, region, patient) rows; `load_results` rejects loading a variant
+  twice.
 - Run the weight-free tests with
-  `python -m unittest tests.test_evaluation_metrics tests.test_evaluation_pipeline`.
+  `PYTHONPATH=src python -m unittest discover -s tests -t tests`
+  (`tests/test_evaluation_safeguards.py` covers the guards above).

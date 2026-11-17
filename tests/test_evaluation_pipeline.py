@@ -42,6 +42,11 @@ from cap6411_atm.training.sampling import PatientLocalBatchSampler
 
 H = W = 32
 DEPTH = 6
+PROVENANCE = {
+    "checkpoint": {"name": "oracle", "sha256": "0" * 64},
+    "dataset": {"name": "synthetic", "sha256": "1" * 64},
+    "manifest": {"name": "synthetic_split", "sha256": "2" * 64},
+}
 
 
 class SyntheticSliceDataset(Dataset):
@@ -49,6 +54,7 @@ class SyntheticSliceDataset(Dataset):
 
     def __init__(self, patients=("P0", "P1", "P2", "P3"), split="validation") -> None:
         self.split = split
+        self.axial_depth = DEPTH
         self.patient_ids = tuple(patients)
         self.samples = tuple((p, z) for p in patients for z in range(DEPTH))
         rng = np.random.default_rng(0)
@@ -144,7 +150,7 @@ class EvaluatorTests(unittest.TestCase):
 
     def test_non_contiguous_patients_are_rejected(self) -> None:
         class Interleaved:
-            dataset = None
+            dataset = self.dataset
 
             def __iter__(inner):
                 for z in range(DEPTH):
@@ -155,6 +161,7 @@ class EvaluatorTests(unittest.TestCase):
                             "target": item["target"][None],
                             "patient_id": [patient],
                             "slice_index": torch.tensor([z]),
+                            "split": ["validation"],
                         }
 
         with self.assertRaises(RuntimeError):
@@ -197,7 +204,7 @@ class StatisticsAndAblationTests(unittest.TestCase):
             return models[spec.name]
 
         cls.variants, cls.build = variants, build
-        cls.frame = run_ablation(variants, build, cls.loader, cls.tmp.name, device="cpu", progress=False)
+        cls.frame = run_ablation(variants, build, cls.loader, cls.tmp.name, provenance=PROVENANCE, device="cpu", progress=False)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -205,7 +212,7 @@ class StatisticsAndAblationTests(unittest.TestCase):
 
     def test_ablation_resumes_without_rebuilding(self) -> None:
         before = list(self.built)
-        run_ablation(self.variants, self.build, self.loader, self.tmp.name, device="cpu", progress=False)
+        run_ablation(self.variants, self.build, self.loader, self.tmp.name, provenance=PROVENANCE, device="cpu", progress=False)
         self.assertEqual(self.built, before)
         self.assertEqual(set(self.frame["method"]), {"baseline", "baseline/nested", "uniform_r0.25", "adaptive_r0.25"})
         self.assertEqual(set(self.frame["family"]), {"baseline", "uniform", "adaptive"})

@@ -22,7 +22,7 @@ import torch
 from _ws4_paths import INSPECTION_CONFIG, MODEL_CONFIG, add_data_args, require
 
 from cap6411_atm.evaluation import (
-    POSTPROCESSING_ABLATION, VariantSpec, build_eval_loader, global_dice, run_ablation, threshold_sweep,
+    POSTPROCESSING_ABLATION, VariantSpec, build_eval_loader, build_provenance, global_dice, run_ablation, threshold_sweep,
 )
 from cap6411_atm.models import (
     BraTSDINOv3Segmenter, DINOv3SegmentationConfig, build_pretrained_brats_dinov3, load_adapter_decoder_artifact,
@@ -64,7 +64,18 @@ def main() -> None:
     variants = [VariantSpec("baseline", method="baseline", merge_ratio=0.0, rules=rules)]
 
     started = time.perf_counter()
-    frame = run_ablation(variants, lambda spec: model, loader, run_dir, device=device, progress=True)
+    provenance = build_provenance(
+        checkpoint={
+            "dinov3": "random init (dry run)" if args.dry_run else args.dinov3_checkpoint,
+            "adapter_decoder": args.artifact,
+        },
+        dataset=args.archive,
+        manifest=args.manifest,
+        inspection_config=INSPECTION_CONFIG,
+        model_config=MODEL_CONFIG.name,
+    )
+    frame = run_ablation(variants, lambda spec: model, loader, run_dir, provenance=provenance,
+                         device=device, progress=True)
     print(f"done in {time.perf_counter() - started:.0f}s -> {run_dir}")
     table = global_dice(frame)
     print(table.round(4).to_string())

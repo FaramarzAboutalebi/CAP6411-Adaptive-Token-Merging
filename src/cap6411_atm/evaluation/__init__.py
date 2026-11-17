@@ -23,6 +23,7 @@ from .postprocess import (
     enforce_nesting,
     threshold_sweep,
 )
+from .provenance import build_provenance, fingerprint_file
 from .statistics import (
     boundary_profile,
     bootstrap_ci,
@@ -49,11 +50,13 @@ __all__ = [
     "bootstrap_ci",
     "build_eval_loader",
     "build_postprocessor",
+    "build_provenance",
     "collect_results",
     "enforce_nesting",
     "evaluate",
     "evaluate_model",
     "failure_cases",
+    "fingerprint_file",
     "format_table",
     "global_dice",
     "lesion_detection",

@@ -51,7 +51,7 @@ Each role includes implementation, testing, experiments, documentation, and cont
 | Dataset & segmentation baseline | Completed |
 | Adaptive token merging | Unassigned |
 | Efficiency & baseline comparisons | Unassigned |
-| Segmentation evaluation & ablations | Baseline evaluated; merging ablations wait on Workstream 2 ([`docs/EVALUATION.md`](docs/EVALUATION.md)) |
+| Segmentation evaluation & ablations | Baseline evaluated (A1, A2, A7); merging ablations A3–A6 wait on Workstream 2 ([`docs/EVALUATION.md`](docs/EVALUATION.md), runbook: [`docs/WORKSTREAM4_RUNBOOK.md`](docs/WORKSTREAM4_RUNBOOK.md)) |
 
 ### Role 1 — Dataset & Segmentation Baseline
 
