@@ -33,9 +33,10 @@ the DINOv3 segmentation baseline, checkpoint resume, and two full-cohort
 training epochs are complete. The best completed full-cohort validation Macro
 Dice is **0.819175669195643** on the 187-patient validation split. This is
 validation performance, not independent-test performance; the 188-patient test
-split remains isolated and unevaluated. Adaptive token merging, standardized
-efficiency benchmarking, method comparisons, and final evaluation remain
-planned work.
+split remains isolated and unevaluated. An opt-in synthetic-tested inter-block
+token-merging path and reusable benchmark/evaluation helpers are now available.
+Official-weight experiments, standardized performance comparisons, and final
+quality evaluation remain planned work; no speedup or quality gain is claimed.
 
 ## Team — Workstreams and Status
 
