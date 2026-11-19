@@ -61,9 +61,12 @@ CHECKPOINT = Path(
     "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
 )
 ARTIFACT = Path(
-    "/content/drive/MyDrive/workstream1_epoch2/"
+    "/content/drive/MyDrive/CAP6411/team_integration/workstream1_epoch2/"
     "dinov3_vitb16_brats_epoch2_adapter_decoder.pt"
 )
+
+assert CHECKPOINT.is_file(), f"Missing authorized DINOv3 checkpoint: {CHECKPOINT}"
+assert ARTIFACT.is_file(), f"Missing WS1 adapter/decoder artifact: {ARTIFACT}"
 
 subprocess.run([
     "python", str(REPO / "scripts/integration_cuda_smoke.py"),
