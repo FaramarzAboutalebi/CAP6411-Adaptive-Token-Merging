@@ -36,21 +36,52 @@ class VariantSpec:
 
     name: str
     method: str = "baseline"  # baseline | uniform | adaptive | lowres | ...
-    merge_ratio: float | None = None
+    retention_ratio: float | None = None
+    merge_ratio: float | None = None  # compatibility alias
     params: Mapping[str, Any] = field(default_factory=dict)
     rules: Mapping[str, Mapping[str, Any]] = field(default_factory=lambda: dict(DEFAULT_RULES))
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_.\-]+", self.name):
             raise ValueError(f"variant name {self.name!r} must be filesystem-safe")
-        if self.merge_ratio is not None and not 0 <= self.merge_ratio < 1:
-            raise ValueError("merge_ratio must lie in [0, 1)")
+        if (
+            self.retention_ratio is not None
+            and self.merge_ratio is not None
+            and self.retention_ratio != self.merge_ratio
+        ):
+            raise ValueError("retention_ratio and merge_ratio aliases disagree")
+        ratio = self.retention_ratio if self.retention_ratio is not None else self.merge_ratio
+        if ratio is not None and not 0 <= ratio <= 1:
+            raise ValueError("retention_ratio must lie in [0, 1]")
+        object.__setattr__(self, "retention_ratio", ratio)
+        object.__setattr__(self, "merge_ratio", ratio)
 
     def info(self) -> dict[str, Any]:
         values = asdict(self)
         values["params"] = dict(self.params)
         values["rules"] = {key: dict(value) for key, value in self.rules.items()}
         return values
+
+
+def retention_ratio_grid(
+    method: str,
+    ratios: Sequence[float],
+    *,
+    params: Mapping[str, Any] | None = None,
+    rules: Mapping[str, Mapping[str, Any]] | None = None,
+) -> list[VariantSpec]:
+    """Variants for a retained-token sweep."""
+
+    return [
+        VariantSpec(
+            name=f"{method}_r{ratio:.2f}",
+            method=method,
+            retention_ratio=float(ratio),
+            params=dict(params or {}),
+            rules=dict(rules or DEFAULT_RULES),
+        )
+        for ratio in ratios
+    ]
 
 
 def merge_ratio_grid(
@@ -60,18 +91,8 @@ def merge_ratio_grid(
     params: Mapping[str, Any] | None = None,
     rules: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[VariantSpec]:
-    """Variants for a merge-ratio sweep, e.g. ``merge_ratio_grid("adaptive", [0.1, 0.25])``."""
-
-    return [
-        VariantSpec(
-            name=f"{method}_r{ratio:.2f}",
-            method=method,
-            merge_ratio=float(ratio),
-            params=dict(params or {}),
-            rules=dict(rules or DEFAULT_RULES),
-        )
-        for ratio in ratios
-    ]
+    """Compatibility alias for :func:`retention_ratio_grid`."""
+    return retention_ratio_grid(method, ratios, params=params, rules=rules)
 
 
 def run_ablation(
@@ -214,7 +235,7 @@ def _check_comparable(summaries: Mapping[Path, Mapping[str, Any]]) -> None:
 def collect_results(
     output_dir: str | Path, names: Sequence[str] | None = None, *, strict: bool = True
 ) -> pd.DataFrame:
-    """Load finished variants and attach their method / merge-ratio metadata.
+    """Load finished variants and attach method / retained-token metadata.
 
     With ``strict`` (default) every variant must carry provenance, its CSV must
     match the recorded checksum, and all variants must share the same split,
@@ -240,8 +261,13 @@ def collect_results(
         variant_info = summary.get("variant_info", {})
         info[summary["variant"]] = {
             "family": variant_info.get("method", "baseline"),
-            "merge_ratio": variant_info.get("merge_ratio"),
+            "retention_ratio": variant_info.get(
+                "retention_ratio", variant_info.get("merge_ratio")
+            ),
         }
     frame["family"] = frame["variant"].map(lambda v: info.get(v, {}).get("family"))
-    frame["merge_ratio"] = frame["variant"].map(lambda v: info.get(v, {}).get("merge_ratio"))
+    frame["retention_ratio"] = frame["variant"].map(
+        lambda v: info.get(v, {}).get("retention_ratio")
+    )
+    frame["merge_ratio"] = frame["retention_ratio"]  # compatibility column
     return frame

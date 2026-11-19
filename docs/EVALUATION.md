@@ -13,7 +13,7 @@ number (validation Macro Dice 0.8192) can be reproduced.
 | `postprocess.py` | Decision rules: threshold, ET ⊆ TC ⊆ WT nesting, small-component and small-total removal |
 | `evaluator.py` | `evaluate_model` (one forward pass, many rules), `save_evaluation`, `build_eval_loader`, batch-level `evaluate` |
 | `statistics.py` | Summaries, bootstrap CIs, paired Wilcoxon + Holm comparisons, strata, failure cases, report tables |
-| `ablation.py` | `VariantSpec`, `merge_ratio_grid`, resumable `run_ablation`, `collect_results` |
+| `ablation.py` | `VariantSpec`, `retention_ratio_grid`, resumable `run_ablation`, `collect_results` |
 | `provenance.py` | `build_provenance`, `fingerprint_file`: checkpoint / dataset / manifest fingerprints and the `run_key` that guards resumed results |
 | `visualization.py` | Case overlays and error maps, token merge maps, metric-vs-ratio/latency plots, profiles |
 

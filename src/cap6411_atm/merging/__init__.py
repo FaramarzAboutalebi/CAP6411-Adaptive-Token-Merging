@@ -57,6 +57,11 @@ class TokenMergeState:
         return self.merged_count / self.original_token_count
 
     @property
+    def retention_ratio(self) -> float:
+        """Requested retention ratio (legacy name: ``merge_ratio``)."""
+        return self.merge_ratio
+
+    @property
     def retention_metrics(self) -> dict[str, int | float | None]:
         """Report requested and actual token counts and retention ratios."""
         requested_ratio = (
@@ -117,33 +122,7 @@ def _resolve_group_shape(
             raise ValueError(f"merge_size entries must be >= 1, received {merge_size}")
         return merge_height, merge_width
 
-    if merge_ratio <= 0.0:
-        return 1, 1
-    if merge_ratio >= 1.0:
-        return 1, 1
-    if not 0.0 < merge_ratio < 1.0:
-        raise ValueError(f"merge_ratio must be in (0, 1), received {merge_ratio}")
-
-    total_tokens = height * width
-    target_retained = max(1, min(total_tokens, int(round(total_tokens * merge_ratio))))
-
-    best_shape = (1, 1)
-    best_error = total_tokens
-    best_retained = total_tokens
-
-    for merge_height in range(1, height + 1):
-        for merge_width in range(1, width + 1):
-            retained = math.ceil(height / merge_height) * math.ceil(width / merge_width)
-            error = abs(retained - target_retained)
-            if error < best_error:
-                best_error = error
-                best_shape = (merge_height, merge_width)
-                best_retained = retained
-            elif error == best_error and retained < best_retained:
-                best_shape = (merge_height, merge_width)
-                best_retained = retained
-
-    return best_shape
+    return 1, 1
 
 
 def _build_group_map(
@@ -165,6 +144,16 @@ def _build_group_map(
     return (
         row_blocks[:, None] * num_col_blocks + col_blocks[None, :]
     ).reshape(-1)
+
+
+def _build_uniform_budget_group_map(
+    num_tokens: int, target_groups: int, *, device: torch.device
+) -> Tensor:
+    """Partition row-major positions into exactly ``target_groups`` balanced groups."""
+    if not 1 <= target_groups <= num_tokens:
+        raise ValueError("target_groups must lie within the original token range")
+    positions = torch.arange(num_tokens, device=device, dtype=torch.long)
+    return torch.div(positions * target_groups, num_tokens, rounding_mode="floor")
 
 
 def _build_coordinate_grid(grid_size: tuple[int, int], device: torch.device) -> Tensor:
@@ -346,10 +335,20 @@ def _validate_merge_state(
         if not torch.equal(state.merge_coordinates.long(), expected_coordinates):
             raise ValueError("merge_coordinates do not match the original row-major grid")
         if state.merged_coordinates is not None:
-            expected_centroids = (
-                membership.to(torch.float32)
-                @ grid_coordinates.to(torch.float32).unsqueeze(0).expand(state.batch_size, -1, -1)
-            ) / actual_group_sizes.to(torch.float32).unsqueeze(-1)
+            expected_centroids = torch.empty_like(
+                state.merged_coordinates, dtype=torch.float32
+            )
+            for batch_index in range(state.batch_size):
+                coordinate_sums = torch.zeros(
+                    state.merged_count, 2, device=device, dtype=torch.float32
+                ).index_add(
+                    0,
+                    state.original_to_merged[batch_index].long(),
+                    grid_coordinates.to(torch.float32),
+                )
+                expected_centroids[batch_index] = coordinate_sums / actual_group_sizes[
+                    batch_index
+                ].to(torch.float32).unsqueeze(-1)
             if not torch.allclose(
                 state.merged_coordinates.to(torch.float32),
                 expected_centroids,
@@ -364,13 +363,15 @@ def merge_tokens(
     *,
     grid_size: tuple[int, int] = (15, 15),
     merge_size: int | tuple[int, int] | None = None,
-    merge_ratio: float = 0.0,
+    merge_ratio: float | None = None,
+    retention_ratio: float | None = None,
     method: str = "uniform",
 ) -> tuple[Tensor, TokenMergeState]:
     """Merge spatial patch tokens by fixed blocks or feature cosine similarity.
 
-    The no-merge path is numerically identical to the baseline when
-    `merge_ratio == 0.0` or `merge_size == (1, 1)`.
+    ``retention_ratio`` is the preferred name for the retained-token fraction.
+    ``merge_ratio`` remains as a compatibility alias. Passing both is allowed
+    only when their values agree.
 
     When `merge_size` is omitted, `merge_ratio` acts as a retention target in the
     range `(0, 1)`. This keeps the API deterministic and makes positive ratios
@@ -379,6 +380,12 @@ def merge_tokens(
     cosine similarities and retains the nearest integer token budget.
     """
 
+    if retention_ratio is not None and merge_ratio is not None and retention_ratio != merge_ratio:
+        raise ValueError("retention_ratio and merge_ratio aliases disagree")
+    requested_ratio = retention_ratio if retention_ratio is not None else merge_ratio
+    if requested_ratio is None:
+        requested_ratio = 0.0
+
     if tokens.ndim != 3:
         raise ValueError(f"expected patch tokens [B,N,D], received {tuple(tokens.shape)}")
     if method not in ("uniform", "adaptive"):
@@ -386,12 +393,12 @@ def merge_tokens(
 
     batch_size, num_tokens, embedding_dim = _validate_input_tokens(tokens, grid_size)
 
-    if not 0.0 <= float(merge_ratio) <= 1.0:
-        raise ValueError(f"merge_ratio must be in [0,1], received {merge_ratio}")
+    if not 0.0 <= float(requested_ratio) <= 1.0:
+        raise ValueError(f"retention_ratio must be in [0,1], received {requested_ratio}")
     if method == "adaptive" and merge_size is not None:
         raise ValueError("merge_size is only supported by the uniform method")
 
-    if merge_size is None and merge_ratio == 0.0:
+    if merge_size is None and requested_ratio == 0.0:
         device = tokens.device
         positions = torch.arange(num_tokens, device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
         identity = positions.clone()
@@ -408,28 +415,33 @@ def merge_tokens(
             merged_coordinates=coordinates.to(dtype=torch.float32),
             merge_size=1,
             method=method,
-            merge_ratio=float(merge_ratio),
+            merge_ratio=float(requested_ratio),
             requested_token_count=num_tokens,
         )
         return tokens.clone(), state
 
     if method == "adaptive":
-        num_groups = max(1, min(num_tokens, int(round(num_tokens * merge_ratio))))
+        num_groups = max(1, min(num_tokens, int(round(num_tokens * requested_ratio))))
         group_maps = _content_adaptive_group_map(tokens, num_groups)
         effective_merge_size = (1, 1)
     else:
-        effective_merge_size = _resolve_group_shape(
-            grid_size, merge_size=merge_size, merge_ratio=merge_ratio
-        )
-        if merge_ratio == 0.0 and merge_size is None:
+        if merge_size is None:
+            num_groups = max(1, min(num_tokens, int(round(num_tokens * requested_ratio))))
             effective_merge_size = (1, 1)
-        group_map = _build_group_map(
-            grid_size, effective_merge_size, device=tokens.device
-        )
-        num_groups = (
-            math.ceil(grid_size[0] / effective_merge_size[0])
-            * math.ceil(grid_size[1] / effective_merge_size[1])
-        )
+            group_map = _build_uniform_budget_group_map(
+                num_tokens, num_groups, device=tokens.device
+            )
+        else:
+            effective_merge_size = _resolve_group_shape(
+                grid_size, merge_size=merge_size, merge_ratio=float(requested_ratio)
+            )
+            group_map = _build_group_map(
+                grid_size, effective_merge_size, device=tokens.device
+            )
+            num_groups = (
+                math.ceil(grid_size[0] / effective_merge_size[0])
+                * math.ceil(grid_size[1] / effective_merge_size[1])
+            )
         group_maps = group_map.unsqueeze(0).expand(batch_size, -1)
 
     merged = torch.empty(batch_size, num_groups, embedding_dim, device=tokens.device, dtype=tokens.dtype)
@@ -445,19 +457,19 @@ def merge_tokens(
     for batch_index in range(batch_size):
         batch_tokens = tokens[batch_index]
         batch_map = group_maps[batch_index]
-        membership = (
-            torch.arange(num_groups, device=tokens.device).unsqueeze(1)
-            == batch_map.unsqueeze(0)
-        )
-        batch_sizes = membership.sum(dim=1)
+        batch_sizes = torch.bincount(batch_map, minlength=num_groups)
         if torch.any(batch_sizes == 0):
             raise RuntimeError("merging produced an empty token group")
-        merged[batch_index] = (
-            membership.to(tokens.dtype) @ batch_tokens
-        ) / batch_sizes.to(tokens.dtype).unsqueeze(1)
-        merged_coordinates[batch_index] = (
-            membership.to(merged_coordinates.dtype) @ coordinates[batch_index].to(torch.float32)
-        ) / batch_sizes.to(merged_coordinates.dtype).unsqueeze(1)
+        token_sums = torch.zeros(
+            num_groups, embedding_dim, device=tokens.device, dtype=tokens.dtype
+        ).index_add(0, batch_map, batch_tokens)
+        merged[batch_index] = token_sums / batch_sizes.to(tokens.dtype).unsqueeze(1)
+        coordinate_sums = torch.zeros(
+            num_groups, 2, device=tokens.device, dtype=torch.float32
+        ).index_add(0, batch_map, coordinates[batch_index].to(torch.float32))
+        merged_coordinates[batch_index] = coordinate_sums / batch_sizes.to(
+            torch.float32
+        ).unsqueeze(1)
         original_to_merged[batch_index] = batch_map
         group_sizes[batch_index] = batch_sizes
         per_group_sizes = group_sizes[batch_index, batch_map]
@@ -473,11 +485,11 @@ def merge_tokens(
         merged_coordinates=merged_coordinates,
         merge_size=effective_merge_size[0] * effective_merge_size[1],
         method=method,
-        merge_ratio=float(merge_ratio),
+        merge_ratio=float(requested_ratio),
         requested_token_count=(
             None
             if merge_size is not None
-            else max(1, min(num_tokens, int(round(num_tokens * merge_ratio))))
+            else max(1, min(num_tokens, int(round(num_tokens * requested_ratio))))
         ),
     )
 
@@ -520,18 +532,23 @@ class UniformTokenMerger:
         *,
         grid_size: tuple[int, int] = (15, 15),
         merge_size: int | tuple[int, int] | None = None,
-        merge_ratio: float = 0.5,
+        merge_ratio: float | None = None,
+        retention_ratio: float | None = None,
     ) -> None:
+        if retention_ratio is not None and merge_ratio is not None and retention_ratio != merge_ratio:
+            raise ValueError("retention_ratio and merge_ratio aliases disagree")
         self.grid_size = grid_size
         self.merge_size = merge_size
-        self.merge_ratio = merge_ratio
+        self.retention_ratio = retention_ratio if retention_ratio is not None else merge_ratio
+        if self.retention_ratio is None:
+            self.retention_ratio = 0.5
 
     def __call__(self, tokens: Tensor) -> tuple[Tensor, TokenMergeState]:
         return merge_tokens(
             tokens,
             grid_size=self.grid_size,
             merge_size=self.merge_size,
-            merge_ratio=self.merge_ratio,
+            retention_ratio=self.retention_ratio,
             method="uniform",
         )
 
@@ -548,16 +565,21 @@ class ContentAdaptiveTokenMerger:
         self,
         *,
         grid_size: tuple[int, int] = (15, 15),
-        merge_ratio: float = 0.5,
+        merge_ratio: float | None = None,
+        retention_ratio: float | None = None,
     ) -> None:
+        if retention_ratio is not None and merge_ratio is not None and retention_ratio != merge_ratio:
+            raise ValueError("retention_ratio and merge_ratio aliases disagree")
         self.grid_size = grid_size
-        self.merge_ratio = merge_ratio
+        self.retention_ratio = retention_ratio if retention_ratio is not None else merge_ratio
+        if self.retention_ratio is None:
+            self.retention_ratio = 0.5
 
     def __call__(self, tokens: Tensor) -> tuple[Tensor, TokenMergeState]:
         return merge_tokens(
             tokens,
             grid_size=self.grid_size,
-            merge_ratio=self.merge_ratio,
+            retention_ratio=self.retention_ratio,
             method="adaptive",
         )
 

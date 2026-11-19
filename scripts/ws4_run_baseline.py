@@ -61,7 +61,7 @@ def main() -> None:
     loader = build_eval_loader(args.archive, args.manifest, INSPECTION_CONFIG, split="validation",
                                patients=patients, batch_size=args.batch_size, cache_dir=args.cache_dir)
     rules = {**POSTPROCESSING_ABLATION, **threshold_sweep([0.3, 0.4, 0.6, 0.7])}
-    variants = [VariantSpec("baseline", method="baseline", merge_ratio=0.0, rules=rules)]
+    variants = [VariantSpec("baseline", method="baseline", rules=rules)]
 
     started = time.perf_counter()
     provenance = build_provenance(

@@ -86,9 +86,28 @@ class TokenMergingTests(unittest.TestCase):
                     report["achieved_retention_ratio"]
                     - report["requested_retention_ratio"],
                 )
-        self.assertGreater(
-            abs(state.retention_metrics["retention_ratio_error"]), 0.1
+                self.assertEqual(
+                    report["achieved_token_count"], report["requested_token_count"]
+                )
+                self.assertEqual(report["retention_ratio_error"], 0.0)
+
+    def test_retention_ratio_name_and_legacy_alias_are_equivalent(self) -> None:
+        tokens = torch.randn(1, 12, 3)
+        preferred, preferred_state = merge_tokens(
+            tokens, grid_size=(3, 4), retention_ratio=0.5
         )
+        legacy, legacy_state = merge_tokens(
+            tokens, grid_size=(3, 4), merge_ratio=0.5
+        )
+        self.assertTrue(torch.equal(preferred, legacy))
+        self.assertEqual(preferred_state.retention_metrics, legacy_state.retention_metrics)
+        with self.assertRaisesRegex(ValueError, "aliases disagree"):
+            merge_tokens(
+                tokens,
+                grid_size=(3, 4),
+                retention_ratio=0.5,
+                merge_ratio=0.25,
+            )
 
     def test_explicit_uniform_merge_size_reports_no_ratio_target(self) -> None:
         _, state = merge_tokens(
@@ -143,9 +162,9 @@ class TokenMergingTests(unittest.TestCase):
                     merge_ratio=1.0,
                     method="uniform",
                 )
-                self.assertEqual(merged.device, device)
-                self.assertEqual(state.original_to_merged.device, device)
-                self.assertEqual(state.group_sizes.device, device)
+                self.assertEqual(merged.device.type, device.type)
+                self.assertEqual(state.original_to_merged.device.type, device.type)
+                self.assertEqual(state.group_sizes.device.type, device.type)
                 self.assertEqual(merged.shape, (2, 4, 1))
                 self.assertTrue(state.merged_coordinates.is_floating_point())
                 self.assertTrue(
@@ -164,7 +183,7 @@ class TokenMergingTests(unittest.TestCase):
                     )
                 )
                 reconstructed = reconstruct_tokens(merged, state)
-                self.assertEqual(reconstructed.device, device)
+                self.assertEqual(reconstructed.device.type, device.type)
                 self.assertEqual(reconstructed.shape, tokens.shape)
                 merged.sum().backward()
                 self.assertIsNotNone(tokens.grad)

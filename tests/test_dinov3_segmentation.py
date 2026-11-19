@@ -341,7 +341,7 @@ class DINOv3SegmentationTests(unittest.TestCase):
         self.assertTrue(all(parameter.grad is not None for parameter in model.decoder.parameters()))
         self.assertTrue(all(parameter.grad is None for parameter in model.encoder.backbone.parameters()))
 
-    def test_uniform_metadata_reports_realized_count_not_requested_ratio(self) -> None:
+    def test_uniform_metadata_reports_exact_requested_retention(self) -> None:
         model = BraTSDINOv3Segmenter(
             BlockwiseSyntheticDINOv3ViTB16(),
             merge_method="uniform",
@@ -352,12 +352,13 @@ class DINOv3SegmentationTests(unittest.TestCase):
 
         self.assertEqual(metadata["merge_method"], "uniform")
         self.assertEqual(metadata["merge_ratio"], 0.75)
+        self.assertEqual(metadata["retention_ratio"], 0.75)
         self.assertEqual(metadata["merge_after_block"], 2)
         self.assertEqual(metadata["first_merged_block"], 3)
         self.assertEqual(metadata["requested_patch_token_count"], 169)
-        self.assertEqual(metadata["achieved_patch_token_count"], 120)
-        self.assertEqual(metadata["merged_sequence_token_count"], 125)
-        self.assertEqual(metadata["block_token_counts"], [230] * 3 + [125] * 9)
+        self.assertEqual(metadata["achieved_patch_token_count"], 169)
+        self.assertEqual(metadata["merged_sequence_token_count"], 174)
+        self.assertEqual(metadata["block_token_counts"], [230] * 3 + [174] * 9)
 
     def test_pretrained_factory_exposes_opt_in_merge_configuration(self) -> None:
         backbone = BlockwiseSyntheticDINOv3ViTB16()

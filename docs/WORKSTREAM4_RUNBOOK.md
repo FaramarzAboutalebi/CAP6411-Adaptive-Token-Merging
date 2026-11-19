@@ -185,8 +185,8 @@ def build_model(spec: VariantSpec) -> torch.nn.Module:
     """Return a model mapping normalized [B,4,240,240] images to raw [B,3,240,240] logits."""
 ```
 
-- `spec.method` is `"uniform"`, `"adaptive"` or `"lowres"`; `spec.merge_ratio`
-  is the fraction of tokens merged; extra options (merge blocks, boundary
+- `spec.method` is `"uniform"`, `"adaptive"` or `"lowres"`; `spec.retention_ratio`
+  is the fraction of tokens retained; extra options (merge blocks, boundary
   protection, reconstruction) go in `spec.params`.
 - Reduced-resolution models must upsample logits back to 240×240.
 - For merge-map figures: the per-sample `[225]` original→merged token
@@ -200,11 +200,30 @@ equal-latency curves.
 `RUN_MERGING = True`, or in Python:
 
 ```python
-from cap6411_atm.evaluation import merge_ratio_grid, run_ablation, paired_comparison
-variants = merge_ratio_grid("uniform", [0.1, 0.25, 0.4, 0.5]) + merge_ratio_grid("adaptive", [0.1, 0.25, 0.4, 0.5])
+from cap6411_atm.evaluation import retention_ratio_grid, run_ablation, paired_comparison
+variants = retention_ratio_grid("uniform", [0.1, 0.25, 0.4, 0.5]) + retention_ratio_grid("adaptive", [0.1, 0.25, 0.4, 0.5])
 frame = run_ablation([baseline_spec, *variants], build_model, loader, run_dir, provenance=provenance, device="cuda")
 paired_comparison(frame[frame["rule"] == "raw"], "baseline")
 ```
+
+For official-weight experiments, use the shared factory so every variant gets
+an independent backbone with the same checkpoint and sanitized adapter/decoder
+artifact:
+
+```python
+from cap6411_atm.evaluation import build_pretrained_model_variant
+
+def build_model(spec):
+    return build_pretrained_model_variant(
+        spec,
+        dinov3_repository,
+        dinov3_checkpoint,
+        adapter_decoder_artifact,
+        config=model_config,
+    )
+```
+
+Weight-free tests can use `build_model_variant(spec, backbone_factory)`.
 
 Each variant reuses the same 187 patients, threshold 0.5 and metrics, so all
 comparisons are paired per patient. Expect about 10–25 min per variant.

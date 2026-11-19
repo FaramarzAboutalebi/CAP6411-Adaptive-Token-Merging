@@ -65,16 +65,16 @@ assignment, aggregation weights/token sizes, and coordinates used by merging.
 
 The standalone API now has two methods:
 
-- `method="uniform"` uses fixed spatial blocks. If `merge_size` is omitted,
-  `merge_ratio` is a requested retained-token fraction and the closest available
-  rectangular block size is selected. Fixed rectangular blocks cannot realize
-  every ratio on every grid, so inspect `state.retention_metrics` and compare
-  methods using achieved retained counts/ratios, not only requested ratios.
+- `method="uniform"` uses balanced groups in original row-major spatial order.
+  If `merge_size` is omitted, `retention_ratio` is converted to an exact retained
+  token count with `round(N * retention_ratio)`. The legacy `merge_ratio` name is
+  accepted as an alias. When an explicit rectangular `merge_size` is used,
+  achieved counts are still recorded but no ratio target is implied.
   When `merge_size` is provided explicitly, ratio-based requested counts are
   reported as `None`; the achieved count and ratio remain available.
 - `method="adaptive"` clusters tokens independently per sample by descending
   pairwise cosine similarity, merging the most similar groups until the retained
-  count is `round(N * merge_ratio)`. This can group non-adjacent positions.
+  count is `round(N * retention_ratio)`. This can group non-adjacent positions.
   `merge_size` is not valid for this method.
 
 The adaptive assignment is discrete and based on detached token content; merged
@@ -86,7 +86,7 @@ each merged group's mean grid coordinate.
 The state reports an observed, serializable retention summary:
 
 ```python
-merged, state = merge_tokens(tokens, grid_size=(15, 15), merge_ratio=0.75)
+merged, state = merge_tokens(tokens, grid_size=(15, 15), retention_ratio=0.75)
 print(state.retention_metrics)
 # Includes requested_token_count, achieved_token_count,
 # requested_retention_ratio, achieved_retention_ratio, and ratio error.
@@ -101,7 +101,7 @@ default baseline path:
 model = BraTSDINOv3Segmenter(
     backbone,
     merge_method="adaptive",
-    merge_ratio=0.5,
+    retention_ratio=0.5,
     merge_after_block=2,
 )
 logits = model(images)

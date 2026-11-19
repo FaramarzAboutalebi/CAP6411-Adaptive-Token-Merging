@@ -160,14 +160,21 @@ class DINOv3Encoder(nn.Module):
         config: DINOv3SegmentationConfig = DINOv3SegmentationConfig(),
         *,
         merge_method: str | None = None,
-        merge_ratio: float = 0.5,
+        merge_ratio: float | None = None,
+        retention_ratio: float | None = None,
         merge_after_block: int = 2,
     ) -> None:
         super().__init__()
         self.backbone = backbone
         self.config = config
+        if retention_ratio is not None and merge_ratio is not None and retention_ratio != merge_ratio:
+            raise ValueError("retention_ratio and merge_ratio aliases disagree")
         self.merge_method = merge_method
-        self.merge_ratio = merge_ratio
+        self.retention_ratio = (
+            retention_ratio if retention_ratio is not None else
+            merge_ratio if merge_ratio is not None else 0.5
+        )
+        self.merge_ratio = self.retention_ratio  # compatibility alias
         self.merge_after_block = merge_after_block
         self._validate_backbone_contract()
         if self.merge_method is not None:
@@ -202,8 +209,10 @@ class DINOv3Encoder(nn.Module):
     def _validate_blockwise_merge_contract(self) -> None:
         if self.merge_method not in ("uniform", "adaptive"):
             raise ValueError(f"unsupported merge method: {self.merge_method!r}")
-        if not 0.0 <= self.merge_ratio <= 1.0:
-            raise ValueError(f"merge_ratio must be in [0,1], received {self.merge_ratio}")
+        if not 0.0 <= self.retention_ratio <= 1.0:
+            raise ValueError(
+                f"retention_ratio must be in [0,1], received {self.retention_ratio}"
+            )
         blocks = getattr(self.backbone, "blocks", None)
         if not isinstance(blocks, (nn.ModuleList, list, tuple)) or len(blocks) != self.config.transformer_blocks:
             raise TypeError("blockwise merging requires the official unchunked DINOv3 blocks")
@@ -301,7 +310,7 @@ class DINOv3Encoder(nn.Module):
                 merged_tokens, merge_state = merge_tokens(
                     patch_tokens,
                     grid_size=grid_size,
-                    merge_ratio=self.merge_ratio,
+                    retention_ratio=self.retention_ratio,
                     method=self.merge_method,
                 )
                 tokens = torch.cat((special_tokens, merged_tokens), dim=1)
@@ -427,7 +436,8 @@ class BraTSDINOv3Segmenter(nn.Module):
         config: DINOv3SegmentationConfig = DINOv3SegmentationConfig(),
         *,
         merge_method: str | None = None,
-        merge_ratio: float = 0.5,
+        merge_ratio: float | None = None,
+        retention_ratio: float | None = None,
         merge_after_block: int = 2,
     ) -> None:
         super().__init__()
@@ -438,9 +448,28 @@ class BraTSDINOv3Segmenter(nn.Module):
             config,
             merge_method=merge_method,
             merge_ratio=merge_ratio,
+            retention_ratio=retention_ratio,
             merge_after_block=merge_after_block,
         )
         self.decoder = DINOv3SegmentationDecoder(config)
+
+    @property
+    def benchmark_family(self) -> str:
+        method = self.encoder.merge_method
+        return "baseline" if method is None else f"{method}_merge"
+
+    @property
+    def benchmark_setting(self) -> str:
+        if self.encoder.merge_method is None:
+            return f"{self.config.input_size[0]}px"
+        return f"retention={self.encoder.retention_ratio:g}"
+
+    @property
+    def token_count(self) -> int:
+        original = self.config.feature_grid[0] * self.config.feature_grid[1]
+        if self.encoder.merge_method is None or self.encoder.retention_ratio == 0.0:
+            return original
+        return max(1, min(original, round(original * self.encoder.retention_ratio)))
 
     def train(self, mode: bool = True) -> "BraTSDINOv3Segmenter":
         super().train(mode)
@@ -499,7 +528,8 @@ class BraTSDINOv3Segmenter(nn.Module):
         ]
         metadata: dict[str, Any] = {
             "merge_method": self.encoder.merge_method,
-            "merge_ratio": self.encoder.merge_ratio if merge_enabled else None,
+            "retention_ratio": self.encoder.retention_ratio if merge_enabled else None,
+            "merge_ratio": self.encoder.retention_ratio if merge_enabled else None,
             "merge_after_block": merge_after_block,
             "first_merged_block": (
                 merge_after_block + 1 if merge_after_block is not None else None
@@ -583,7 +613,8 @@ def build_pretrained_brats_dinov3(
     config: DINOv3SegmentationConfig = DINOv3SegmentationConfig(),
     *,
     merge_method: str | None = None,
-    merge_ratio: float = 0.5,
+    merge_ratio: float | None = None,
+    retention_ratio: float | None = None,
     merge_after_block: int = 2,
 ) -> BraTSDINOv3Segmenter:
     """Build the baseline or opt-in merging model from an authorized checkpoint."""
@@ -594,5 +625,6 @@ def build_pretrained_brats_dinov3(
         config,
         merge_method=merge_method,
         merge_ratio=merge_ratio,
+        retention_ratio=retention_ratio,
         merge_after_block=merge_after_block,
     )
