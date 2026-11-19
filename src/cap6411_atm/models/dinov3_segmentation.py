@@ -9,6 +9,7 @@ random weights for the requested pretrained model.
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,8 @@ from typing import Any, Sequence
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+
+from ..merging import TokenMergeState, merge_tokens, reconstruct_tokens
 
 
 DINOV3_VITB16_CHECKPOINT = "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
@@ -112,23 +115,63 @@ class MRIInputAdapter(nn.Module):
         return self.projection(images)
 
 
+def _rope_for_merged_coordinates(
+    rope_embedding: nn.Module,
+    coordinates: Tensor,
+    grid_size: tuple[int, int],
+) -> tuple[Tensor, Tensor]:
+    """Evaluate DINOv3 axial RoPE at per-sample merged-token coordinates."""
+    periods = getattr(rope_embedding, "periods", None)
+    if not isinstance(periods, Tensor):
+        raise TypeError("DINOv3 RoPE module must expose its periods tensor")
+    normalize = getattr(rope_embedding, "normalize_coords", None)
+    if normalize == "max":
+        height_denominator = width_denominator = max(grid_size)
+    elif normalize == "min":
+        height_denominator = width_denominator = min(grid_size)
+    elif normalize == "separate":
+        height_denominator, width_denominator = grid_size
+    else:
+        raise ValueError(f"unsupported DINOv3 RoPE coordinate normalization: {normalize!r}")
+
+    rope_dtype = getattr(rope_embedding, "dtype", None) or periods.dtype
+    coords = coordinates.to(device=periods.device, dtype=rope_dtype)
+    row = 2.0 * (coords[..., 0] + 0.5) / height_denominator - 1.0
+    col = 2.0 * (coords[..., 1] + 0.5) / width_denominator - 1.0
+    normalized_coords = torch.stack((row, col), dim=-1)
+    angles = 2.0 * math.pi * normalized_coords.unsqueeze(-1) / periods[None, None, None, :]
+    angles = angles.flatten(-2).tile(2)
+    sin = angles.sin().unsqueeze(1)
+    cos = angles.cos().unsqueeze(1)
+    return sin, cos
+
+
 class DINOv3Encoder(nn.Module):
     """Freeze DINOv3 parameters while preserving input-adapter autograd.
 
-    The wrapper calls the official patch-only intermediate-feature API, so the
-    class token and four storage tokens participate inside the transformer but
-    are not returned to the dense decoder.
+    By default the wrapper calls the official patch-only intermediate-feature
+    API. Optional blockwise merging instead retains protected special tokens,
+    propagates coordinate-aware RoPE, and reconstructs dense features at taps.
     """
 
     def __init__(
         self,
         backbone: nn.Module,
         config: DINOv3SegmentationConfig = DINOv3SegmentationConfig(),
+        *,
+        merge_method: str | None = None,
+        merge_ratio: float = 0.5,
+        merge_after_block: int = 2,
     ) -> None:
         super().__init__()
         self.backbone = backbone
         self.config = config
+        self.merge_method = merge_method
+        self.merge_ratio = merge_ratio
+        self.merge_after_block = merge_after_block
         self._validate_backbone_contract()
+        if self.merge_method is not None:
+            self._validate_blockwise_merge_contract()
         self.backbone.requires_grad_(False)
         self.backbone.eval()
 
@@ -156,6 +199,27 @@ class DINOv3Encoder(nn.Module):
                 f"incompatible DINOv3 patch_size: expected 16, received {patch_size}"
             )
 
+    def _validate_blockwise_merge_contract(self) -> None:
+        if self.merge_method not in ("uniform", "adaptive"):
+            raise ValueError(f"unsupported merge method: {self.merge_method!r}")
+        if not 0.0 <= self.merge_ratio <= 1.0:
+            raise ValueError(f"merge_ratio must be in [0,1], received {self.merge_ratio}")
+        blocks = getattr(self.backbone, "blocks", None)
+        if not isinstance(blocks, (nn.ModuleList, list, tuple)) or len(blocks) != self.config.transformer_blocks:
+            raise TypeError("blockwise merging requires the official unchunked DINOv3 blocks")
+        if bool(getattr(self.backbone, "chunked_blocks", False)):
+            raise ValueError("blockwise merging does not support chunked DINOv3 blocks")
+        if not callable(getattr(self.backbone, "prepare_tokens_with_masks", None)):
+            raise TypeError("blockwise merging requires prepare_tokens_with_masks")
+        if not callable(getattr(self.backbone, "rope_embed", None)):
+            raise TypeError("blockwise merging requires DINOv3 RoPE embeddings")
+        if not callable(getattr(self.backbone, "norm", None)):
+            raise TypeError("blockwise merging requires the DINOv3 final norm")
+        if not 0 <= self.merge_after_block < self.config.transformer_blocks - 1:
+            raise ValueError(
+            f"merge_after_block must be in [0,{self.config.transformer_blocks - 2}]"
+            )
+
     def train(self, mode: bool = True) -> "DINOv3Encoder":
         super().train(mode)
         self.backbone.eval()
@@ -168,6 +232,9 @@ class DINOv3Encoder(nn.Module):
                 f"expected adapted images [B,{expected[0]},{expected[1]},{expected[2]}], "
                 f"received {tuple(images.shape)}"
             )
+        if self.merge_method is not None:
+            features, _ = self.forward_features_with_merge_state(images)
+            return features
         # Deliberately not wrapped in no_grad: gradients must reach the adapter.
         outputs = self.backbone.get_intermediate_layers(
             images,
@@ -195,6 +262,86 @@ class DINOv3Encoder(nn.Module):
                     f"!= {expected_feature}"
                 )
         return features
+
+    def forward_features_with_merge_state(
+        self, images: Tensor
+    ) -> tuple[tuple[Tensor, ...], TokenMergeState | None]:
+        """Return dense tap maps and the state used for any inter-block merge."""
+        expected = (self.config.encoder_channels, *self.config.input_size)
+        if images.ndim != 4 or tuple(images.shape[1:]) != expected:
+            raise ValueError(
+                f"expected adapted images [B,{expected[0]},{expected[1]},{expected[2]}], "
+                f"received {tuple(images.shape)}"
+            )
+        if self.merge_method is None:
+            return self.forward_features(images), None
+
+        tokens, grid_size = self.backbone.prepare_tokens_with_masks(images)
+        grid_size = tuple(grid_size)
+        if len(grid_size) != 2 or grid_size != self.config.feature_grid:
+            raise RuntimeError(
+                f"DINOv3 patch grid {grid_size} != expected {self.config.feature_grid}"
+            )
+        special_count = 1 + int(self.backbone.n_storage_tokens)
+        if int(self.backbone.n_storage_tokens) != self.config.storage_tokens:
+            raise RuntimeError("DINOv3 storage-token count changed after contract validation")
+        if tokens.shape[1] != special_count + grid_size[0] * grid_size[1]:
+            raise RuntimeError("DINOv3 prepared sequence has an unexpected token count")
+
+        rope_embedding = self.backbone.rope_embed
+        rope = rope_embedding(H=grid_size[0], W=grid_size[1])
+        merge_state: TokenMergeState | None = None
+        feature_outputs: list[Tensor] = []
+        tap_blocks = set(self.config.feature_blocks)
+
+        for block_index, block in enumerate(self.backbone.blocks):
+            if block_index == self.merge_after_block + 1:
+                special_tokens = tokens[:, :special_count]
+                patch_tokens = tokens[:, special_count:]
+                merged_tokens, merge_state = merge_tokens(
+                    patch_tokens,
+                    grid_size=grid_size,
+                    merge_ratio=self.merge_ratio,
+                    method=self.merge_method,
+                )
+                tokens = torch.cat((special_tokens, merged_tokens), dim=1)
+                if merged_tokens.shape[1] == grid_size[0] * grid_size[1]:
+                    rope = rope_embedding(H=grid_size[0], W=grid_size[1])
+                else:
+                    if merge_state.merged_coordinates is None:
+                        raise RuntimeError("merger did not provide merged spatial coordinates")
+                    rope = _rope_for_merged_coordinates(
+                        rope_embedding, merge_state.merged_coordinates, grid_size
+                    )
+
+            tokens = block(tokens, rope)
+            if block_index in tap_blocks:
+                patches = tokens[:, special_count:]
+                if merge_state is not None:
+                    patches = reconstruct_tokens(patches, merge_state)
+                patches = self.backbone.norm(patches)
+                feature = patches.reshape(
+                    patches.shape[0], grid_size[0], grid_size[1], patches.shape[-1]
+                ).permute(0, 3, 1, 2).contiguous()
+                feature_outputs.append(feature)
+
+        if len(feature_outputs) != len(self.config.feature_blocks):
+            raise RuntimeError(
+                f"blockwise encoder returned {len(feature_outputs)} taps; "
+                f"expected {len(self.config.feature_blocks)}"
+            )
+        expected_feature = (
+            images.shape[0],
+            self.config.embedding_dim,
+            *self.config.feature_grid,
+        )
+        for block, feature in zip(self.config.feature_blocks, feature_outputs):
+            if tuple(feature.shape) != expected_feature:
+                raise RuntimeError(
+                    f"DINOv3 block {block} feature shape {tuple(feature.shape)} "
+                    f"!= {expected_feature}"
+                )
+        return tuple(feature_outputs), merge_state
 
     def forward(self, images: Tensor) -> tuple[Tensor, ...]:
         return self.forward_features(images)
@@ -268,17 +415,31 @@ class DINOv3SegmentationDecoder(nn.Module):
 
 
 class BraTSDINOv3Segmenter(nn.Module):
-    """Compose the MRI adapter, frozen DINOv3 encoder, and dense decoder."""
+    """Compose the MRI adapter, frozen DINOv3 encoder, and dense decoder.
+
+    Inter-block token merging is opt-in; the default preserves the audited
+    baseline execution path.
+    """
 
     def __init__(
         self,
         backbone: nn.Module,
         config: DINOv3SegmentationConfig = DINOv3SegmentationConfig(),
+        *,
+        merge_method: str | None = None,
+        merge_ratio: float = 0.5,
+        merge_after_block: int = 2,
     ) -> None:
         super().__init__()
         self.config = config
         self.adapter = MRIInputAdapter()
-        self.encoder = DINOv3Encoder(backbone, config)
+        self.encoder = DINOv3Encoder(
+            backbone,
+            config,
+            merge_method=merge_method,
+            merge_ratio=merge_ratio,
+            merge_after_block=merge_after_block,
+        )
         self.decoder = DINOv3SegmentationDecoder(config)
 
     def train(self, mode: bool = True) -> "BraTSDINOv3Segmenter":
@@ -287,7 +448,7 @@ class BraTSDINOv3Segmenter(nn.Module):
         return self
 
     def extract_features(self, images: Tensor) -> tuple[Tensor, ...]:
-        """Return four dense maps for decoding or future reconstruction hooks."""
+        """Return four dense feature maps, reconstructed if inter-block merging is enabled."""
 
         expected = (self.config.input_channels, *self.config.input_size)
         if images.ndim != 4 or tuple(images.shape[1:]) != expected:
@@ -297,8 +458,66 @@ class BraTSDINOv3Segmenter(nn.Module):
             )
         return self.encoder.forward_features(self.adapter(images))
 
+    def extract_features_with_merge_state(
+        self, images: Tensor
+    ) -> tuple[tuple[Tensor, ...], TokenMergeState | None]:
+        """Return dense tap maps and this forward's realized merge state."""
+        expected = (self.config.input_channels, *self.config.input_size)
+        if images.ndim != 4 or tuple(images.shape[1:]) != expected:
+            raise ValueError(
+                f"expected images [B,{expected[0]},{expected[1]},{expected[2]}], "
+                f"received {tuple(images.shape)}"
+            )
+        return self.encoder.forward_features_with_merge_state(self.adapter(images))
+
+    def forward_with_metadata(self, images: Tensor) -> tuple[Tensor, dict[str, Any]]:
+        """Run segmentation and return realized token/merge metadata for this pass."""
+        features, state = self.extract_features_with_merge_state(images)
+        logits = self.decode_features(features)
+        original_patch_tokens = self.config.feature_grid[0] * self.config.feature_grid[1]
+        special_tokens = self.encoder.special_token_count
+        achieved_patch_tokens = (
+            state.merged_count if state is not None else original_patch_tokens
+        )
+        retained = state.retention_metrics if state is not None else {
+            "original_token_count": original_patch_tokens,
+            "requested_token_count": original_patch_tokens,
+            "achieved_token_count": original_patch_tokens,
+            "requested_retention_ratio": 1.0,
+            "achieved_retention_ratio": 1.0,
+            "retention_ratio_error": 0.0,
+        }
+        merge_enabled = self.encoder.merge_method is not None
+        merge_after_block = self.encoder.merge_after_block if merge_enabled else None
+        block_token_counts = [
+            (
+                original_patch_tokens + special_tokens
+                if not merge_enabled or block_index <= self.encoder.merge_after_block
+                else achieved_patch_tokens + special_tokens
+            )
+            for block_index in range(self.config.transformer_blocks)
+        ]
+        metadata: dict[str, Any] = {
+            "merge_method": self.encoder.merge_method,
+            "merge_ratio": self.encoder.merge_ratio if merge_enabled else None,
+            "merge_after_block": merge_after_block,
+            "first_merged_block": (
+                merge_after_block + 1 if merge_after_block is not None else None
+            ),
+            "feature_blocks": list(self.config.feature_blocks),
+            "special_token_count": special_tokens,
+            "original_patch_token_count": original_patch_tokens,
+            "requested_patch_token_count": retained["requested_token_count"],
+            "achieved_patch_token_count": achieved_patch_tokens,
+            "original_sequence_token_count": original_patch_tokens + special_tokens,
+            "merged_sequence_token_count": achieved_patch_tokens + special_tokens,
+            "block_token_counts": block_token_counts,
+            "retention_metrics": retained,
+        }
+        return logits, metadata
+
     def decode_features(self, features: Sequence[Tensor]) -> Tensor:
-        """Decode dense spatial maps; future mergers must reconstruct before this boundary."""
+        """Decode the four dense feature maps emitted by the encoder."""
 
         return self.decoder(features)
 
@@ -362,8 +581,18 @@ def build_pretrained_brats_dinov3(
     repository: str | Path,
     checkpoint: str | Path,
     config: DINOv3SegmentationConfig = DINOv3SegmentationConfig(),
+    *,
+    merge_method: str | None = None,
+    merge_ratio: float = 0.5,
+    merge_after_block: int = 2,
 ) -> BraTSDINOv3Segmenter:
-    """Build the audited baseline from an authorized official checkpoint."""
+    """Build the baseline or opt-in merging model from an authorized checkpoint."""
 
     backbone = load_official_dinov3_vitb16(repository, checkpoint, config)
-    return BraTSDINOv3Segmenter(backbone, config)
+    return BraTSDINOv3Segmenter(
+        backbone,
+        config,
+        merge_method=merge_method,
+        merge_ratio=merge_ratio,
+        merge_after_block=merge_after_block,
+    )

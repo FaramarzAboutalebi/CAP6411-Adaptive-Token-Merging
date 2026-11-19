@@ -10,12 +10,15 @@ from unittest import mock
 import torch
 from torch import nn
 
+from cap6411_atm.benchmark import benchmark_inference
+from cap6411_atm.evaluation import evaluate_segmentation
 from cap6411_atm.models import (
     DINOV3_VITB16_CHECKPOINT,
     BraTSDINOv3Segmenter,
     DINOv3Encoder,
     DINOv3SegmentationConfig,
     MRIInputAdapter,
+    build_pretrained_brats_dinov3,
     load_official_dinov3_vitb16,
 )
 
@@ -76,6 +79,110 @@ class SyntheticDINOv3ViTB16(nn.Module):
         return tuple(outputs)
 
 
+class SyntheticRopePositionEmbedding(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("periods", torch.linspace(1.0, 100.0, 16))
+        self.dtype = torch.float32
+        self.normalize_coords = "separate"
+
+    def forward(self, *, H: int, W: int) -> tuple[torch.Tensor, torch.Tensor]:
+        rows = (torch.arange(H, dtype=self.dtype, device=self.periods.device) + 0.5) / H
+        cols = (torch.arange(W, dtype=self.dtype, device=self.periods.device) + 0.5) / W
+        coords = torch.stack(torch.meshgrid(rows, cols, indexing="ij"), dim=-1).flatten(0, 1)
+        coords = 2.0 * coords - 1.0
+        angles = (2.0 * torch.pi * coords[:, :, None] / self.periods[None, None, :])
+        angles = angles.flatten(1, 2).tile(2)
+        return angles.sin(), angles.cos()
+
+
+class SyntheticTransformerBlock(nn.Module):
+    def __init__(self, index: int) -> None:
+        super().__init__()
+        self.index = index
+        self.input_token_count = 0
+        self.last_input: torch.Tensor | None = None
+        self.last_output: torch.Tensor | None = None
+        self.rope_shape: tuple[int, ...] | None = None
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        rope: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> torch.Tensor:
+        self.input_token_count = tokens.shape[1]
+        self.last_input = tokens.detach().clone()
+        output = tokens + (self.index + 1) * 0.001
+        if rope is not None:
+            sin, _ = rope
+            self.rope_shape = tuple(sin.shape)
+            positions = sin.mean(dim=-1)
+            if positions.ndim == 3:
+                positions = positions.squeeze(1)
+            patch_count = sin.shape[-2]
+            prefix_count = output.shape[1] - patch_count
+            patch_tokens = output[:, prefix_count:] + positions.unsqueeze(-1) * 0.001
+            output = torch.cat((output[:, :prefix_count], patch_tokens), dim=1)
+        else:
+            self.rope_shape = None
+        self.last_output = output.detach().clone()
+        return output
+
+
+class BlockwiseSyntheticDINOv3ViTB16(SyntheticDINOv3ViTB16):
+    """Fixture exposing the pinned official block, token-prep, and RoPE APIs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            SyntheticTransformerBlock(index) for index in range(self.n_blocks)
+        )
+        self.rope_embed = SyntheticRopePositionEmbedding()
+        self.norm = nn.LayerNorm(self.embed_dim)
+        self.chunked_blocks = False
+
+    def prepare_tokens_with_masks(
+        self, images: torch.Tensor, masks: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, tuple[int, int]]:
+        patch_map = self.patch_embed(images)
+        batch, channels, height, width = patch_map.shape
+        patches = patch_map.flatten(2).transpose(1, 2)
+        tokens = torch.cat(
+            (
+                self.cls_token.expand(batch, -1, -1),
+                self.storage_tokens.expand(batch, -1, -1),
+                patches,
+            ),
+            dim=1,
+        )
+        return tokens, (height, width)
+
+    def get_intermediate_layers(
+        self,
+        images: torch.Tensor,
+        *,
+        n,
+        reshape: bool,
+        return_class_token: bool,
+        return_extra_tokens: bool,
+        norm: bool,
+    ):
+        tokens, (height, width) = self.prepare_tokens_with_masks(images)
+        rope = self.rope_embed(H=height, W=width)
+        outputs = []
+        for index, block in enumerate(self.blocks):
+            tokens = block(tokens, rope)
+            if index in n:
+                output = self.norm(tokens) if norm else tokens
+                patches = output[:, 1 + self.n_storage_tokens :]
+                if reshape:
+                    patches = patches.reshape(
+                        images.shape[0], height, width, self.embed_dim
+                    ).permute(0, 3, 1, 2)
+                outputs.append(patches.contiguous())
+        return tuple(outputs)
+
+
 class DINOv3SegmentationTests(unittest.TestCase):
     def setUp(self) -> None:
         torch.manual_seed(42)
@@ -125,6 +232,18 @@ class DINOv3SegmentationTests(unittest.TestCase):
         self.assertTrue(logits.is_floating_point())
         self.assertTrue(torch.isfinite(logits).all())
 
+    def test_baseline_forward_metadata_reports_unmerged_encoder_counts(self) -> None:
+        logits, metadata = self.model.forward_with_metadata(torch.randn(1, 4, 240, 240))
+
+        self.assertEqual(logits.shape, (1, 3, 240, 240))
+        self.assertIsNone(metadata["merge_method"])
+        self.assertIsNone(metadata["merge_ratio"])
+        self.assertIsNone(metadata["merge_after_block"])
+        self.assertEqual(metadata["original_patch_token_count"], 225)
+        self.assertEqual(metadata["achieved_patch_token_count"], 225)
+        self.assertEqual(metadata["special_token_count"], 5)
+        self.assertEqual(metadata["block_token_counts"], [230] * 12)
+
     def test_backbone_frozen_adapter_decoder_trainable_and_eval_locked(self) -> None:
         self.assertTrue(all(not parameter.requires_grad for parameter in self.backbone.parameters()))
         self.assertTrue(all(parameter.requires_grad for parameter in self.model.adapter.parameters()))
@@ -146,6 +265,141 @@ class DINOv3SegmentationTests(unittest.TestCase):
             all(parameter.grad is not None for parameter in self.model.decoder.parameters())
         )
         self.assertTrue(all(parameter.grad is None for parameter in self.backbone.parameters()))
+
+    def test_inter_block_zero_ratio_matches_official_dense_path(self) -> None:
+        backbone = BlockwiseSyntheticDINOv3ViTB16()
+        images = torch.randn(1, 3, 240, 240)
+        baseline = DINOv3Encoder(backbone).forward_features(images)
+        merged_encoder = DINOv3Encoder(
+            backbone,
+            merge_method="adaptive",
+            merge_ratio=0.0,
+            merge_after_block=2,
+        )
+        merged, state = merged_encoder.forward_features_with_merge_state(images)
+
+        self.assertIsNotNone(state)
+        for expected, actual in zip(baseline, merged):
+            self.assertTrue(torch.equal(expected, actual))
+        self.assertTrue(all(block.input_token_count == 230 for block in backbone.blocks))
+        self.assertTrue(all(block.rope_shape == (225, 64) for block in backbone.blocks))
+
+    def test_inter_block_merge_protects_special_tokens_and_reconstructs_all_taps(self) -> None:
+        backbone = BlockwiseSyntheticDINOv3ViTB16()
+        encoder = DINOv3Encoder(
+            backbone,
+            merge_method="adaptive",
+            merge_ratio=0.5,
+            merge_after_block=2,
+        )
+        features, state = encoder.forward_features_with_merge_state(
+            torch.randn(1, 3, 240, 240)
+        )
+
+        self.assertIsNotNone(state)
+        self.assertEqual(len(features), 4)
+        self.assertTrue(all(feature.shape == (1, 768, 15, 15) for feature in features))
+        processed_token_counts = [block.input_token_count for block in backbone.blocks]
+        self.assertEqual(processed_token_counts[:3], [230, 230, 230])
+        self.assertEqual(processed_token_counts[3:], [117] * 9)
+        self.assertTrue(all(count < 230 for count in processed_token_counts[3:]))
+        self.assertTrue(
+            torch.equal(
+                backbone.blocks[3].last_input[:, : encoder.special_token_count],
+                backbone.blocks[2].last_output[:, : encoder.special_token_count],
+            )
+        )
+        self.assertEqual(backbone.blocks[3].rope_shape, (1, 1, 112, 64))
+
+        for feature, block_index in zip(features, self.model.config.feature_blocks):
+            block_output = backbone.blocks[block_index].last_output
+            patch_tokens = block_output[:, encoder.special_token_count :]
+            if block_index > 2:
+                from cap6411_atm.merging import reconstruct_tokens
+
+                patch_tokens = reconstruct_tokens(patch_tokens, state)
+            expected = backbone.norm(patch_tokens).reshape(1, 15, 15, 768)
+            expected = expected.permute(0, 3, 1, 2).contiguous()
+            self.assertTrue(torch.equal(feature, expected))
+
+    def test_segmenter_decodes_inter_block_merged_features(self) -> None:
+        model = BraTSDINOv3Segmenter(
+            BlockwiseSyntheticDINOv3ViTB16(),
+            merge_method="adaptive",
+            merge_ratio=0.5,
+            merge_after_block=2,
+        )
+        logits = model(torch.randn(1, 4, 240, 240))
+        self.assertEqual(logits.shape, (1, 3, 240, 240))
+        self.assertTrue(torch.isfinite(logits).all())
+        probabilities = torch.sigmoid(logits)
+        self.assertEqual(probabilities.shape, (1, 3, 240, 240))
+        self.assertTrue(torch.isfinite(probabilities).all())
+        self.assertTrue(torch.all((probabilities >= 0.0) & (probabilities <= 1.0)))
+        logits.square().mean().backward()
+        self.assertTrue(all(parameter.grad is not None for parameter in model.adapter.parameters()))
+        self.assertTrue(all(parameter.grad is not None for parameter in model.decoder.parameters()))
+        self.assertTrue(all(parameter.grad is None for parameter in model.encoder.backbone.parameters()))
+
+    def test_uniform_metadata_reports_realized_count_not_requested_ratio(self) -> None:
+        model = BraTSDINOv3Segmenter(
+            BlockwiseSyntheticDINOv3ViTB16(),
+            merge_method="uniform",
+            merge_ratio=0.75,
+            merge_after_block=2,
+        )
+        _, metadata = model.forward_with_metadata(torch.randn(1, 4, 240, 240))
+
+        self.assertEqual(metadata["merge_method"], "uniform")
+        self.assertEqual(metadata["merge_ratio"], 0.75)
+        self.assertEqual(metadata["merge_after_block"], 2)
+        self.assertEqual(metadata["first_merged_block"], 3)
+        self.assertEqual(metadata["requested_patch_token_count"], 169)
+        self.assertEqual(metadata["achieved_patch_token_count"], 120)
+        self.assertEqual(metadata["merged_sequence_token_count"], 125)
+        self.assertEqual(metadata["block_token_counts"], [230] * 3 + [125] * 9)
+
+    def test_pretrained_factory_exposes_opt_in_merge_configuration(self) -> None:
+        backbone = BlockwiseSyntheticDINOv3ViTB16()
+        with mock.patch(
+            "cap6411_atm.models.dinov3_segmentation.load_official_dinov3_vitb16",
+            return_value=backbone,
+        ):
+            model = build_pretrained_brats_dinov3(
+                "authorized-repository",
+                "authorized-checkpoint",
+                merge_method="adaptive",
+                merge_ratio=0.4,
+                merge_after_block=5,
+            )
+        self.assertEqual(model.encoder.merge_method, "adaptive")
+        self.assertEqual(model.encoder.merge_ratio, 0.4)
+        self.assertEqual(model.encoder.merge_after_block, 5)
+
+    def test_inter_block_model_runs_through_benchmark_and_evaluation_apis(self) -> None:
+        model = BraTSDINOv3Segmenter(
+            BlockwiseSyntheticDINOv3ViTB16(),
+            merge_method="adaptive",
+            merge_ratio=0.5,
+            merge_after_block=2,
+        )
+        images = torch.randn(1, 4, 240, 240)
+        targets = torch.zeros(1, 3, 240, 240)
+
+        timing = benchmark_inference(model, images, warmup=0, iterations=1)
+        metrics = evaluate_segmentation(
+            model, [{"image": images, "target": targets}]
+        )
+
+        self.assertEqual(timing["output_shape"], [1, 3, 240, 240])
+        self.assertEqual(timing["experiment_metadata"]["merge_method"], "adaptive")
+        self.assertEqual(timing["experiment_metadata"]["achieved_patch_token_count"], 112)
+        self.assertEqual(
+            timing["experiment_metadata"]["block_token_counts"], [230] * 3 + [117] * 9
+        )
+        self.assertEqual(metrics["samples"], 1)
+        self.assertEqual(set(metrics["dice"]), {"WT", "TC", "ET"})
+        self.assertEqual(metrics["experiment_metadata"], timing["experiment_metadata"])
 
     def test_incompatible_storage_tokens_are_rejected(self) -> None:
         backbone = SyntheticDINOv3ViTB16()
