@@ -33,9 +33,10 @@ the DINOv3 segmentation baseline, checkpoint resume, and two full-cohort
 training epochs are complete. The best completed full-cohort validation Macro
 Dice is **0.819175669195643** on the 187-patient validation split. This is
 validation performance, not independent-test performance; the 188-patient test
-split remains isolated and unevaluated. Adaptive token merging, standardized
-efficiency benchmarking, method comparisons, and final evaluation remain
-planned work.
+split remains isolated and unevaluated. An opt-in synthetic-tested inter-block
+token-merging path and reusable benchmark/evaluation helpers are now available.
+Official-weight experiments, standardized performance comparisons, and final
+quality evaluation remain planned work; no speedup or quality gain is claimed.
 
 ## Team — Workstreams and Status
 
@@ -51,7 +52,7 @@ Each role includes implementation, testing, experiments, documentation, and cont
 | Dataset & segmentation baseline | Completed |
 | Adaptive token merging | Unassigned |
 | Efficiency & baseline comparisons | Unassigned |
-| Segmentation evaluation & ablations | Unassigned |
+| Segmentation evaluation & ablations | Baseline evaluated (A1, A2, A7); merging ablations A3–A6 wait on Workstream 2 ([`docs/EVALUATION.md`](docs/EVALUATION.md), runbook: [`docs/WORKSTREAM4_RUNBOOK.md`](docs/WORKSTREAM4_RUNBOOK.md)) |
 
 ### Role 1 — Dataset & Segmentation Baseline
 
@@ -353,7 +354,7 @@ We aim to deliver:
 - [ ] Working uniform token merging
 - [ ] Working adaptive token merging
 - [ ] Reduced-resolution comparison
-- [ ] Dice and boundary evaluation
+- [ ] Dice and boundary evaluation (pipeline on `feature/evaluation`; see [`docs/EVALUATION.md`](docs/EVALUATION.md))
 - [ ] Real latency and peak-memory measurements
 - [ ] Matched-latency quality comparison
 - [ ] Ablation experiments and failure analysis
